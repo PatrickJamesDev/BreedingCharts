@@ -1,7 +1,6 @@
 <!-- ABOUT THE PROJECT -->
 ## About The Project
 
-[![Product Name Screen Shot][product-screenshot]](https://example.com)
 
 BreedingCharts is a free program for easily making charts of plant lineages for plant breeders. 
 
@@ -16,11 +15,15 @@ BreedingCharts includes features such as:
 
 <img width="2560" height="1400" alt="python_a90RkrL4fg" src="https://github.com/user-attachments/assets/5601964d-e3dc-42fb-8919-562f2438c169" />
 
+<img width="2560" height="1400" alt="python_kfKE3VegyH" src="https://github.com/user-attachments/assets/b2f90f01-0050-408c-80c7-1701ae0f3c21" />
+
+
+
 
 <!-- GETTING STARTED -->
 ## Getting Started
 
-Run the precompiled executable for Windows/Linux/MacOS. I have no way of testing the Linux and MacOS versions, let me know if there are problems. 
+Run the precompiled executable .exe for Windows. 
 
 
 
@@ -48,5 +51,6 @@ Run the precompiled executable for Windows/Linux/MacOS. I have no way of testing
 
 * [BotaniTree for inspiration.]( https://github.com/jackhannon/BotaniTree-demo)
 * [Pepper Lovers Community](https://discord.com/invite/peppers)
+* This program was heavily vibe coded using Claude Sonnet 4.6. 
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
