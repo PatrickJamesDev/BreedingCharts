@@ -15,6 +15,9 @@ BreedingCharts includes features such as:
 
 <img width="2560" height="1400" alt="python_a90RkrL4fg" src="https://github.com/user-attachments/assets/5601964d-e3dc-42fb-8919-562f2438c169" />
 
+<img width="2560" height="1400" alt="pt2" src="https://github.com/user-attachments/assets/37106d26-26d5-4cbe-9368-bf7143429155" />
+
+
 <img width="2560" height="1400" alt="python_kfKE3VegyH" src="https://github.com/user-attachments/assets/b2f90f01-0050-408c-80c7-1701ae0f3c21" />
 
 
@@ -23,7 +26,7 @@ BreedingCharts includes features such as:
 <!-- GETTING STARTED -->
 ## Getting Started
 
-Run the precompiled executable .exe for Windows. 
+Download the .zip from releases, unzip it, and run the precompiled BreedingCharts.exe for Windows. 
 
 
 
