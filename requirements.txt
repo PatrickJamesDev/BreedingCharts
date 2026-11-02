@@ -1,0 +1,5 @@
+PyQt6>=6.4.0
+# Optional but recommended: much faster atomic saves (falls back to streamed json without it)
+orjson>=3.9
+# PyQt6-Qt6-Svg is optional — needed only for SVG export
+# PyQt6-Qt6-PrintSupport is NOT required — PDF export uses QPdfWriter (built into QtGui)

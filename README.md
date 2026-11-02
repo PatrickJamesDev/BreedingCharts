@@ -33,7 +33,7 @@ Download the .zip from releases, unzip it, and run the precompiled BreedingChart
 ### Installation from source
 
 1. Clone the repo
-2. Unzip and run:
+2. Install the dependencies:
    ```sh
    pip install -r requirements.txt
    ```
@@ -41,6 +41,17 @@ Download the .zip from releases, unzip it, and run the precompiled BreedingChart
    ```sh
    python main.py
    ```
+
+`orjson` is optional but recommended: saves are faster and remain atomic when it is
+installed (the app falls back to the standard library encoder otherwise).
+
+The source tree includes the v1.24 performance and data-safety fixes described in
+`CHANGES_PERF.md` and the full audit document. Headless verification scripts live in
+`tools/verification/`:
+
+```sh
+QT_QPA_PLATFORM=offscreen python tools/verification/verify_f1.py
+```
 
 
 
