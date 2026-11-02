@@ -13,7 +13,7 @@ v1.2.0 additions:
   • Export PNG wires watermark_text / watermark_opacity from settings
 """
 from __future__ import annotations
-import base64, logging, os
+import base64, copy, logging, os
 from typing import Optional, List
 
 from PyQt6.QtWidgets import (
@@ -141,6 +141,7 @@ class DatabaseSidebar(QWidget):
         self.setObjectName("sidebar_panel")
         self.setFixedWidth(245)
         self._all_files:     list  = []   # [(path, meta)]
+        self._row_by_path:   dict  = {}
         self._sort_mode      = sort_mode
         self._show_categories= show_categories
         self._custom_order:  List[str] = load_sidebar_order()
@@ -305,15 +306,15 @@ class DatabaseSidebar(QWidget):
             self.refresh()
             return
 
-        for i in range(self._list.count()):
-            item = self._list.item(i)
-            if item and item.data(Qt.ItemDataRole.UserRole) == path:
-                n = meta["node_count"]
-                cat_tag = f" [{meta['category']}]" if meta.get("category") else ""
-                item.setText(
-                    f"  {meta['name']}{cat_tag}\n"
-                    f"  {n} plant{'s' if n != 1 else ''}  ·  {meta['modified']}")
-                return
+        row = self._row_by_path.get(path)
+        item = self._list.item(row) if row is not None else None
+        if item and item.data(Qt.ItemDataRole.UserRole) == path:
+            n = meta["node_count"]
+            cat_tag = f" [{meta['category']}]" if meta.get("category") else ""
+            item.setText(
+                f"  {meta['name']}{cat_tag}\n"
+                f"  {n} plant{'s' if n != 1 else ''}  ·  {meta['modified']}")
+            return
 
     @staticmethod
     def _fuzzy_match(query: str, text: str) -> bool:
@@ -346,6 +347,13 @@ class DatabaseSidebar(QWidget):
             ph = QListWidgetItem("No results." if q else "No lineages found.")
             ph.setFlags(Qt.ItemFlag.NoItemFlags)
             self._list.addItem(ph)
+
+        self._row_by_path = {}
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            p = it.data(Qt.ItemDataRole.UserRole) if it else None
+            if p:
+                self._row_by_path[p] = i
 
     def _render_flat(self, items: list) -> None:
         for path, meta in items:
@@ -817,49 +825,71 @@ class MainWindow(QMainWindow):
             save_settings(self._settings); self._status("Settings saved.")
 
     def _apply_settings(self, s: AppSettings) -> None:
+        old = getattr(self, "_applied_settings", None)
         self._settings = s
-        # Re-applying an identical application-wide stylesheet is not free:
-        # Qt re-polishes every existing widget, which measured at ~0.6 s once
-        # the window is fully built.  main.py already sets this stylesheet
-        # before the window is constructed, so on the normal startup path this
-        # is a no-op — and widgets created afterwards pick the sheet up
-        # automatically at polish time, so skipping it loses nothing.
         app = QApplication.instance()
         sheet = build_stylesheet(s)
         if app.styleSheet() != sheet:
             app.setStyleSheet(sheet)
+
         p = THEMES.get(s.theme, THEMES["dark"])
-        self._view.set_theme_palette(p)
-        self._view.set_font_size(s.font_size)
-        self._view.set_font_family(s.font_family)
-        self._view.set_show_grid(s.show_grid)
+        theme_changed = old is None or old.theme != s.theme
+        font_size_changed = old is None or old.font_size != s.font_size
+        font_family_changed = old is None or old.font_family != s.font_family
+        grid_changed = old is None or old.show_grid != s.show_grid
+        if theme_changed:
+            self._view.set_theme_palette(p)
+        if font_size_changed:
+            self._view.set_font_size(s.font_size)
+        if font_family_changed:
+            self._view.set_font_family(s.font_family)
+        if grid_changed:
+            self._view.set_show_grid(s.show_grid)
 
-        # Pass the palette into apply_settings so it can update theme colours
-        # AND font/card/edge settings in a single pass — avoids the two
-        # separate _rebuild_edges() calls that caused visible lag.
-        self._scene.apply_settings(s, palette=p)
-
-        # Batch all three card-style parameters into one call so _rebuild_grid
-        # runs at most once (vs three times when called separately).
-        self._grid_view.apply_card_settings(
-            palette   = p,
-            font      = getattr(s, "card_font_family", "Georgia"),
-            font_size = getattr(s, "card_font_size",   9),
+        scene_sig = (
+            s.theme, s.font_family, s.card_font_family, s.card_font_size,
+            s.font_size, s.img_scale_factor, s.show_images, s.color_code_lines,
+            s.mother_line_color, s.father_line_color, s.card_style.to_dict(),
         )
-        self._notes_view.set_palette(p)
+        old_scene_sig = None if old is None else (
+            old.theme, old.font_family, old.card_font_family, old.card_font_size,
+            old.font_size, old.img_scale_factor, old.show_images, old.color_code_lines,
+            old.mother_line_color, old.father_line_color, old.card_style.to_dict(),
+        )
+        if old_scene_sig != scene_sig:
+            self._scene.apply_settings(s, palette=p)
+
+        card_sig = (s.theme, s.card_font_family, s.card_font_size)
+        old_card_sig = None if old is None else (
+            old.theme, old.card_font_family, old.card_font_size)
+        if old_card_sig != card_sig:
+            self._grid_view.apply_card_settings(
+                palette   = p,
+                font      = getattr(s, "card_font_family", "Georgia"),
+                font_size = getattr(s, "card_font_size",   9),
+            )
+        if theme_changed:
+            self._notes_view.set_palette(p)
 
         self._act_props.setChecked(s.show_props_panel)
         self._props.setVisible(s.show_props_panel)
         for tid, a in self._theme_actions.items(): a.setChecked(tid == s.theme)
-        for aid, action in self._actions.items():
-            ks = s.keybinds.get(aid,"")
-            action.setShortcut(QKeySequence(ks) if ks else QKeySequence())
-        if s.autosave: self._autosave_timer.start(s.autosave_mins*60*1000)
-        else:          self._autosave_timer.stop()
-        # v1.2.0 — sync sidebar sort/category settings
-        self._sidebar.set_sort_mode(getattr(s, "sidebar_sort", "name_asc"))
-        self._sidebar._show_categories = getattr(s, "sidebar_show_categories", True)
-        self._sidebar._filter(self._sidebar._search.text())
+        if old is None or old.keybinds != s.keybinds:
+            for aid, action in self._actions.items():
+                ks = s.keybinds.get(aid,"")
+                action.setShortcut(QKeySequence(ks) if ks else QKeySequence())
+        if old is None or old.autosave != s.autosave or old.autosave_mins != s.autosave_mins:
+            if s.autosave: self._autosave_timer.start(s.autosave_mins*60*1000)
+            else:          self._autosave_timer.stop()
+        sidebar_sort = getattr(s, "sidebar_sort", "name_asc")
+        show_categories = getattr(s, "sidebar_show_categories", True)
+        old_sort = None if old is None else getattr(old, "sidebar_sort", "name_asc")
+        old_cats = None if old is None else getattr(old, "sidebar_show_categories", True)
+        if old_sort != sidebar_sort or old_cats != show_categories:
+            self._sidebar.set_sort_mode(sidebar_sort)
+            self._sidebar._show_categories = show_categories
+            self._sidebar._filter(self._sidebar._search.text())
+        self._applied_settings = copy.deepcopy(s)
 
     def _quick_set_theme(self, tid: str) -> None:
         self._settings.theme = tid; self._apply_settings(self._settings)
@@ -1004,6 +1034,8 @@ class MainWindow(QMainWindow):
             os.remove(path)
             import lineage_images
             lineage_images.delete_sidecar(path)
+            from database import delete_lineage_meta
+            delete_lineage_meta(path)
         except Exception as e:
             QMessageBox.critical(self, "Delete Error", str(e))
             return
@@ -1463,6 +1495,7 @@ class MainWindow(QMainWindow):
 
         # Always persist to the global plant database
         plant_db.upsert(node)
+        plant_db.evict_images(node.id)
         self._grid_view.mark_dirty()
 
         if in_grid_view:
@@ -1493,6 +1526,7 @@ class MainWindow(QMainWindow):
         dlg = PlantDialog(node, self, is_new=True)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._scene.add_node(node); plant_db.upsert(node)
+            plant_db.evict_images(node.id)
             self._update_node_count(); self._status(f"Added: {node.name}")
 
     def _add_comment_at(self, x: float, y: float) -> None:
@@ -1530,6 +1564,7 @@ class MainWindow(QMainWindow):
             # just because the user changed a year or name in the lineage.
             if plant_db.has_node(node_id):
                 plant_db.upsert(node)
+                plant_db.evict_images(node.id)
                 self._grid_view.mark_dirty()
 
             # Save the role chosen in the dialog back to ALL children of this node
@@ -1571,7 +1606,8 @@ class MainWindow(QMainWindow):
             node = PlantNode()
             dlg  = PlantDialog(node, self, is_new=True)
             if dlg.exec() != QDialog.DialogCode.Accepted: return
-            self._scene.add_node(node); plant_db.upsert(node); other_id = node.id
+            self._scene.add_node(node); plant_db.upsert(node)
+            plant_db.evict_images(node.id); other_id = node.id
         else:
             idx = labels.index(choice) - 1; other_id = existing[idx][1]
         if role == "child":
@@ -1831,6 +1867,7 @@ class MainWindow(QMainWindow):
             vr = self._view.mapToScene(self._view.viewport().rect()).boundingRect()
             node.x = vr.center().x(); node.y = vr.center().y()
             self._scene.add_node(node); plant_db.upsert(node)
+            plant_db.evict_images(node.id)
             self._update_node_count(); self._status(f"Created '{node.name}' from pasted image.")
 
     def _import_csv(self) -> None:

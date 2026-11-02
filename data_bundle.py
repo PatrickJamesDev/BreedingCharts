@@ -175,13 +175,13 @@ def import_bundle(filepath: str) -> BundleImportResult:
                 dest_path = _db.default_filepath(
                     tree_dict.get("name", "Imported Lineage"), directory=data_dir)
                 dest_path = _unique_path(dest_path)
-                with open(dest_path, "w", encoding="utf-8") as fh:
-                    json.dump(tree_dict, fh, indent=2, ensure_ascii=False)
+                from fileio import atomic_write_json, atomic_write_bytes
+                atomic_write_json(dest_path, tree_dict)
+                _db.write_lineage_meta(dest_path, tree_dict)
 
                 sidecar_arc = arc + ".images"
                 if sidecar_arc in names:
-                    with open(dest_path + ".images", "wb") as fh:
-                        fh.write(zf.read(sidecar_arc))
+                    atomic_write_bytes(dest_path + ".images", zf.read(sidecar_arc))
 
                 if tree_id:
                     existing_ids.add(tree_id)

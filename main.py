@@ -31,7 +31,7 @@ if _DEBUG:
     perf.mark("main.py startup")
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 
 from settings import load_settings, save_settings, build_stylesheet
 import database
@@ -48,13 +48,6 @@ def main() -> None:
         app.setApplicationName("BreedingCharts")
         app.setOrganizationName("Botanical Tools")
         app.setApplicationVersion(__version__)
-
-        # Pre-spin the image-decode thread pool now, while startup is already
-        # doing other work, so the first lineage the user opens doesn't pay
-        # for worker-thread creation on top of its own decode work.
-        with perf.timed("warmup_decode_threadpool"):
-            from canvas_view import warmup_decode_threadpool
-            warmup_decode_threadpool()
 
         with perf.timed("load_settings"):
             s = load_settings()
@@ -98,6 +91,9 @@ def main() -> None:
 
         window.show()
         perf.mark("window.show() complete")
+
+        from canvas_view import warmup_decode_threadpool
+        QTimer.singleShot(0, warmup_decode_threadpool)
 
         code = app.exec()
         log.info("Application exited with code %d", code)

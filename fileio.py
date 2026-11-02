@@ -17,6 +17,22 @@ def path_lock(path: str) -> threading.Lock:
         return _locks.setdefault(key, threading.Lock())
 
 
+def atomic_write_bytes(path: str, data: bytes) -> None:
+    """Atomically replace `path` with raw `data` (temp + fsync + os.replace)."""
+    d = os.path.dirname(os.path.abspath(path))
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush(); os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+
+
 def atomic_write_json(path: str, obj, *, pretty: bool = False) -> None:
     """Serialise, write to a temp file in the same folder, fsync, os.replace.
 

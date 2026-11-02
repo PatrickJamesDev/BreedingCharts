@@ -14,6 +14,7 @@ New features:
 """
 from __future__ import annotations
 import base64
+import collections
 import csv
 import io
 import logging
@@ -933,7 +934,7 @@ class PlantGridView(QWidget):
 
         # Staggered image decode queue — processes ONE card per event-loop tick
         # so card grid construction is instant and images appear progressively.
-        self._img_decode_queue: list["MiniPlantCard"] = []
+        self._img_decode_queue: collections.deque = collections.deque()
         self._img_decode_timer = QTimer(self)
         self._img_decode_timer.setInterval(0)   # fire between event-loop iterations
         self._img_decode_timer.timeout.connect(self._decode_next_card)
@@ -1468,7 +1469,7 @@ class PlantGridView(QWidget):
         """Timer callback — loads one queued card image per event-loop tick.
         Processes live cards only; skips any that were removed since enqueuing."""
         while self._img_decode_queue:
-            card = self._img_decode_queue.pop(0)
+            card = self._img_decode_queue.popleft()
             if card.parent() is not None:   # still attached to the widget tree
                 try:
                     card._load_image()

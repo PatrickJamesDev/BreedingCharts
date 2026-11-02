@@ -148,27 +148,32 @@ def _meta_json(meta: dict) -> str:
 
 
 def _ensure_conn() -> sqlite3.Connection:
-    """Open (and if necessary create/migrate) the SQLite database."""
+    """Open (and if necessary create/migrate) the SQLite database.
+
+    Callers may already hold ``_lock`` (it is re-entrant); taking it here keeps
+    two threads from opening/migrating the same database concurrently.
+    """
     global _conn, _db_path
-    if _conn is not None:
-        return _conn
-    path = _sqlite_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA cache_size=-32000")   # ~32 MB page cache
-        conn.executescript(_SCHEMA)
-        conn.commit()
-    except Exception:
-        conn.close()
-        raise
-    _conn = conn
-    _db_path = path
-    _migrate_from_json_if_needed(conn)
-    return conn
+    with _lock:
+        if _conn is not None:
+            return _conn
+        path = _sqlite_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        conn = sqlite3.connect(path, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            conn.execute("PRAGMA cache_size=-32000")   # ~32 MB page cache
+            conn.executescript(_SCHEMA)
+            conn.commit()
+        except Exception:
+            conn.close()
+            raise
+        _conn = conn
+        _db_path = path
+        _migrate_from_json_if_needed(conn)
+        return conn
 
 
 def _migrate_from_json_if_needed(conn: sqlite3.Connection) -> bool:

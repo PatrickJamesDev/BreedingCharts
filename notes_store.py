@@ -76,12 +76,8 @@ def _save() -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         out = {nid: n.to_dict() for nid, n in (_cache or {}).items()}
-        # Write to a sibling temp file and replace atomically: a crash or
-        # power loss mid-write can no longer leave a truncated notes.json.
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(out, fh, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        from fileio import atomic_write_json
+        atomic_write_json(path, out)
     except Exception as e:
         log.error("notes_store: save error: %s", e)
 

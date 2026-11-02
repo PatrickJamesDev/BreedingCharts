@@ -81,8 +81,8 @@ def set_data_dir(new_dir: str) -> bool:
     try:
         os.makedirs(new_dir, exist_ok=True)
         ptr_file = os.path.join(APP_DIR, "data_dir.txt")
-        with open(ptr_file, "w", encoding="utf-8") as f:
-            f.write(new_dir)
+        from fileio import atomic_write_bytes
+        atomic_write_bytes(ptr_file, new_dir.encode("utf-8"))
         _data_dir = new_dir
         log.info("Data directory set → %s", new_dir)
         return True
@@ -115,12 +115,53 @@ def get_lineage_files(directory: str = None) -> List[str]:
         return []
 
 
+def _meta_path(filepath: str) -> str:
+    return filepath + ".meta"
+
+
+def _meta_from_doc(d: dict) -> dict:
+    return {
+        "name":        d.get("name", "Unknown"),
+        "description": d.get("description", ""),
+        "node_count":  len(d.get("nodes", {})),
+        "modified":    d.get("modified_at", "")[:10],
+        "category":    d.get("category", ""),
+        "sort_index":  int(d.get("sort_index", 0)),
+    }
+
+
+def _normalise_meta(raw: dict) -> dict:
+    base = _meta_from_doc({})
+    base.update({k: raw[k] for k in base if k in raw})
+    base["node_count"] = int(base.get("node_count") or 0)
+    base["sort_index"] = int(base.get("sort_index") or 0)
+    return base
+
+
+def write_lineage_meta(filepath: str, d: dict) -> dict:
+    """Write the small <file>.plf.meta sidecar (best effort) and return its meta."""
+    meta = _meta_from_doc(d)
+    try:
+        from fileio import atomic_write_json
+        atomic_write_json(_meta_path(filepath), meta)
+    except Exception as e:
+        log.warning("write_lineage_meta(%s): %s", filepath, e)
+    return meta
+
+
+def delete_lineage_meta(filepath: str) -> None:
+    try:
+        os.remove(_meta_path(filepath))
+    except OSError:
+        pass
+
+
 def get_lineage_meta(filepath: str) -> dict:
     """Return lightweight metadata for a lineage file.
 
-    Uses an mtime cache so the file is only re-parsed when it changes on disk.
-    A stat() call takes ~0.05 ms vs ~150 ms to parse a large .plf — a 3000× speedup
-    on cache hits.
+    Uses an mtime cache plus the small <file>.plf.meta sidecar written on save.
+    Listing a large library therefore reads a few hundred bytes per lineage
+    instead of re-parsing every .plf (which embeds every thumbnail).
     """
     try:
         mtime = os.path.getmtime(filepath)
@@ -128,17 +169,19 @@ def get_lineage_meta(filepath: str) -> dict:
         if cached and cached[0] == mtime:
             return cached[1]
 
+        try:
+            if os.path.getmtime(_meta_path(filepath)) >= mtime:
+                with open(_meta_path(filepath), "r", encoding="utf-8") as fh:
+                    meta = _normalise_meta(json.load(fh))
+                _meta_cache[filepath] = (mtime, meta)
+                return meta
+        except Exception:
+            pass
+
         with open(filepath, "r", encoding="utf-8") as fh:
             d = json.load(fh)
 
-        meta = {
-            "name":        d.get("name", "Unknown"),
-            "description": d.get("description", ""),
-            "node_count":  len(d.get("nodes", {})),
-            "modified":    d.get("modified_at", "")[:10],
-            "category":    d.get("category", ""),
-            "sort_index":  int(d.get("sort_index", 0)),
-        }
+        meta = write_lineage_meta(filepath, d)
         _meta_cache[filepath] = (mtime, meta)
         return meta
 
@@ -187,7 +230,11 @@ def save_lineage(tree: LineageTree, filepath: str) -> bool:
             lineage_images.evict_saved_images(tree)
             tree._images_maybe_stale = False
 
-        _invalidate_meta(filepath)   # force sidebar to re-read fresh meta
+        meta = write_lineage_meta(filepath, d)
+        try:
+            _meta_cache[filepath] = (os.path.getmtime(filepath), meta)
+        except OSError:
+            _invalidate_meta(filepath)
         log.info("Saved '%s' → %s", tree.name, filepath)
         return True
     except Exception as e:
@@ -238,11 +285,9 @@ def write_prepared_save(prepared: dict, filepath: str) -> bool:
             lineage_images.merge_and_save_snapshot(
                 filepath, prepared["images_snapshot"], prepared["valid_ids"])
         d = prepared["doc"]
+        meta = write_lineage_meta(filepath, d)
         try:
-            _meta_cache[filepath] = (os.path.getmtime(filepath), {
-                "name": d.get("name", "Unknown"), "description": d.get("description", ""),
-                "node_count": len(d.get("nodes", {})), "modified": d.get("modified_at", "")[:10],
-                "category": d.get("category", ""), "sort_index": int(d.get("sort_index", 0))})
+            _meta_cache[filepath] = (os.path.getmtime(filepath), meta)
         except OSError:
             _invalidate_meta(filepath)
         log.info("Saved (background) → %s", filepath)
@@ -303,8 +348,9 @@ def _migrate_legacy_inline_images(tree: LineageTree, raw_dict: dict, filepath: s
         d = tree.to_dict()
         for node_d in d.get("nodes", {}).values():
             node_d["images"] = []
-        with open(filepath, "w", encoding="utf-8") as fh:
-            json.dump(d, fh, indent=2, ensure_ascii=False)
+        from fileio import atomic_write_json
+        atomic_write_json(filepath, d)
+        write_lineage_meta(filepath, d)
         _invalidate_meta(filepath)
     except Exception as e:
         log.error("_migrate_legacy_inline_images: rewrite failed for %s: %s", filepath, e)
@@ -350,8 +396,8 @@ def _order_file() -> str:
 def save_sidebar_order(ordered_paths: List[str]) -> None:
     try:
         names = [os.path.basename(p) for p in ordered_paths]
-        with open(_order_file(), "w", encoding="utf-8") as fh:
-            json.dump(names, fh)
+        from fileio import atomic_write_json
+        atomic_write_json(_order_file(), names)
     except Exception as e:
         log.warning("save_sidebar_order: %s", e)
 

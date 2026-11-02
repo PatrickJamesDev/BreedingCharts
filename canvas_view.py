@@ -132,6 +132,9 @@ class EdgeItem(QGraphicsPathItem):
         # Wider invisible hit area so edge is easy to right-click
         self.setAcceptHoverEvents(True)
         self._hovered = False
+        self._arrow_path = None
+        self._shape_cache = None
+        self._arrow_brush = None
         self.update_path()
 
     def hoverEnterEvent(self, event) -> None:
@@ -148,12 +151,11 @@ class EdgeItem(QGraphicsPathItem):
         pen = QPen(col, 3.5 if hov else 2.0)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         self.setPen(pen)
+        self._arrow_brush = None
 
     def update_path(self) -> None:
         p1 = self.parent_item.bottom_port_scene()
         p2 = self.child_item.top_port_scene()
-        # Cache endpoint positions so paint() can reuse them without calling
-        # mapToScene() again — mapToScene() traverses the full item parent chain.
         self._cached_p1 = p1
         self._cached_p2 = p2
         dy = max(40.0, abs(p2.y() - p1.y()) * 0.5)
@@ -161,28 +163,18 @@ class EdgeItem(QGraphicsPathItem):
         path.cubicTo(QPointF(p1.x(), p1.y()+dy),
                      QPointF(p2.x(), p2.y()-dy), p2)
         self.setPath(path)
+        self._arrow_path = None
+        self._shape_cache = None
 
-    def set_color(self, color: str) -> None:
-        self._color = color; self._update_pen(); self.update()
-
-    def shape(self) -> "QPainterPath":
-        """Widen the hit area to 12px so edges are easy to right-click."""
-        stroker = QPainterPathStroker()
-        stroker.setWidth(12)
-        return stroker.createStroke(self.path())
-
-    def paint(self, painter: QPainter, option, widget=None) -> None:
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        super().paint(painter, option, widget)
-        # Reuse cached endpoints — avoids two mapToScene() calls per edge per frame.
-        p2  = getattr(self, "_cached_p2", None) or self.child_item.top_port_scene()
-        p1b = getattr(self, "_cached_p1", None) or self.parent_item.bottom_port_scene()
-        dy    = max(40.0, abs(p2.y() - p1b.y()) * 0.5)
+    def _ensure_arrow_path(self) -> None:
+        if self._arrow_path is not None:
+            return
+        p1 = self._cached_p1
+        p2 = self._cached_p2
+        dy    = max(40.0, abs(p2.y() - p1.y()) * 0.5)
         ctrl  = QPointF(p2.x(), p2.y() - dy)
         angle = math.atan2(p2.y()-ctrl.y(), p2.x()-ctrl.x())
         aw, ah = 8, 5
-        painter.setPen(QPen(Qt.PenStyle.NoPen))
-        painter.setBrush(QBrush(QColor(self._color)))
         arr = QPainterPath()
         arr.moveTo(p2)
         arr.lineTo(p2.x()-aw*math.cos(angle)+ah*math.sin(angle),
@@ -190,7 +182,28 @@ class EdgeItem(QGraphicsPathItem):
         arr.lineTo(p2.x()-aw*math.cos(angle)-ah*math.sin(angle),
                    p2.y()-aw*math.sin(angle)+ah*math.cos(angle))
         arr.closeSubpath()
-        painter.drawPath(arr)
+        self._arrow_path = arr
+
+    def set_color(self, color: str) -> None:
+        self._color = color; self._update_pen(); self.update()
+
+    def shape(self) -> "QPainterPath":
+        """Widen the hit area to 12px so edges are easy to right-click."""
+        if self._shape_cache is None:
+            stroker = QPainterPathStroker()
+            stroker.setWidth(12)
+            self._shape_cache = stroker.createStroke(self.path())
+        return self._shape_cache
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        super().paint(painter, option, widget)
+        self._ensure_arrow_path()
+        if self._arrow_brush is None:
+            self._arrow_brush = QBrush(QColor(self._color))
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.setBrush(self._arrow_brush)
+        painter.drawPath(self._arrow_path)
 
 
 # ── Comment (resizable sticky note) ──────────────────────────────────────────
@@ -207,6 +220,8 @@ class CommentItem(QGraphicsItem):
         self._resizing  = False
         self._resize_start_pos = QPointF()
         self._resize_start_wh  = (note.w, note.h)
+        self._dragging = False
+        self._drag_changed = False
 
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable,            True)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable,         True)
@@ -266,6 +281,8 @@ class CommentItem(QGraphicsItem):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            self._drag_changed = False
             if self._handle_rect().contains(event.pos()):
                 self._resizing = True
                 self._resize_start_pos = event.scenePos()
@@ -281,13 +298,18 @@ class CommentItem(QGraphicsItem):
             self._note.w = max(self.MIN_W, self._resize_start_wh[0] + delta.x())
             self._note.h = max(self.MIN_H, self._resize_start_wh[1] + delta.y())
             self.update()
-            sc = self.scene()
-            if sc: sc.tree_changed.emit()
+            self._drag_changed = True
             event.accept(); return
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self._resizing = False; super().mouseReleaseEvent(event)
+        self._resizing = False
+        super().mouseReleaseEvent(event)
+        self._dragging = False
+        if self._drag_changed:
+            self._drag_changed = False
+            sc = self.scene()
+            if sc: sc.tree_changed.emit()
 
     def mouseDoubleClickEvent(self, event):
         self._open_editor(); super().mouseDoubleClickEvent(event)
@@ -314,8 +336,11 @@ class CommentItem(QGraphicsItem):
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
             self._note.x = self.pos().x(); self._note.y = self.pos().y()
-            sc = self.scene()
-            if sc: sc.tree_changed.emit()
+            if getattr(self, "_dragging", False):
+                self._drag_changed = True
+            else:
+                sc = self.scene()
+                if sc: sc.tree_changed.emit()
         return super().itemChange(change, value)
 
     def update_palette(self, p: dict, ff: str = "Segoe UI") -> None:
@@ -676,20 +701,72 @@ class LineageScene(QGraphicsScene):
                     self._node_edge_index.setdefault(pid,   []).append(e)
                     self._node_edge_index.setdefault(cn.id, []).append(e)
 
-    def _add_edges_for_child(self, cn) -> None:
+    def _add_edge_for_parent(self, cn, pid: str) -> None:
         ci = self._node_items.get(cn.id)
-        if not ci: return
+        pi = self._node_items.get(pid)
+        if not ci or not pi:
+            return
+        role = cn.parent_roles.get(pid, "")
+        if role:
+            self._role_map[pid] = role
+        if self.color_code_lines and role == "mother":
+            col = self.mother_line_color
+        elif self.color_code_lines and role == "father":
+            col = self.father_line_color
+        else:
+            col = pi.node_color()
+        e = EdgeItem(pi, ci, col)
+        self.addItem(e)
+        self._edges.append(e)
+        self._node_edge_index.setdefault(pid, []).append(e)
+        self._node_edge_index.setdefault(cn.id, []).append(e)
+
+    def _add_edges_for_child(self, cn) -> None:
         for pid in cn.parent_ids:
-            pi = self._node_items.get(pid)
-            if not pi: continue
-            role = cn.parent_roles.get(pid, "")
-            if role: self._role_map[pid] = role
-            if self.color_code_lines and role == "mother": col = self.mother_line_color
-            elif self.color_code_lines and role == "father": col = self.father_line_color
-            else: col = pi.node_color()
-            e = EdgeItem(pi, ci, col); self.addItem(e); self._edges.append(e)
-            self._node_edge_index.setdefault(pid, []).append(e)
-            self._node_edge_index.setdefault(cn.id, []).append(e)
+            self._add_edge_for_parent(cn, pid)
+
+    def _remove_edge_item(self, e) -> None:
+        try:
+            self._edges.remove(e)
+        except ValueError:
+            pass
+        try:
+            self.removeItem(e)
+        except Exception:
+            pass
+        for nid in (e.parent_item.node.id, e.child_item.node.id):
+            lst = self._node_edge_index.get(nid)
+            if not lst:
+                continue
+            try:
+                lst.remove(e)
+            except ValueError:
+                pass
+            if not lst:
+                self._node_edge_index.pop(nid, None)
+
+    def _remove_edges_for_nodes(self, node_ids) -> None:
+        seen = set()
+        for nid in node_ids:
+            for e in list(self._node_edge_index.get(nid, [])):
+                if id(e) not in seen:
+                    seen.add(id(e))
+                    self._remove_edge_item(e)
+
+    def _rebuild_role_map(self) -> None:
+        before = dict(self._role_map)
+        self._role_map.clear()
+        if self.tree:
+            for cn in self.tree.nodes.values():
+                for pid in cn.parent_ids:
+                    role = cn.parent_roles.get(pid, "")
+                    if role:
+                        self._role_map[pid] = role
+        for pid in set(before) | set(self._role_map):
+            if before.get(pid) != self._role_map.get(pid):
+                item = self._node_items.get(pid)
+                if item:
+                    item.update()
 
     def _on_node_move_start(self, _: str) -> None:
         self._push_undo()
@@ -812,10 +889,12 @@ class LineageScene(QGraphicsScene):
     def remove_node(self, node_id: str) -> None:
         if not self.tree: return
         self._push_undo()
+        self._remove_edges_for_nodes({node_id})
         item = self._node_items.pop(node_id, None)
         if item: self.removeItem(item)
         self.tree.remove_node(node_id)
-        self._rebuild_edges(); self._update_year_rows(); self._recalc_scene_rect()
+        self._rebuild_role_map()
+        self._update_year_rows(); self._recalc_scene_rect()
         self.tree_changed.emit()
 
     def add_comment(self, note: CommentNote) -> None:
@@ -833,14 +912,20 @@ class LineageScene(QGraphicsScene):
         if not self.tree: return False
         self._push_undo()
         ok = self.tree.connect_parent(parent_id, child_id)
-        if ok: self._rebuild_edges(); self.tree_changed.emit()
+        if ok:
+            self._add_edge_for_parent(self.tree.nodes[child_id], parent_id)
+            self.tree_changed.emit()
         return ok
 
     def remove_connection(self, parent_id: str, child_id: str) -> None:
         if not self.tree: return
         self._push_undo()
         self.tree.disconnect_parent(parent_id, child_id)
-        self._rebuild_edges(); self.tree_changed.emit()
+        for e in list(self._node_edge_index.get(child_id, [])):
+            if e.parent_item.node.id == parent_id:
+                self._remove_edge_item(e)
+        self._rebuild_role_map()
+        self.tree_changed.emit()
 
     def delete_selected(self) -> None:
         if not self.tree:
@@ -852,12 +937,13 @@ class LineageScene(QGraphicsScene):
         # batch.  The previous per-node loop did all of that K times, making
         # a large multi-selection delete O(K × (N + E + snapshot)).
         self._push_undo()
+        self._remove_edges_for_nodes(ids)
         for nid in ids:
             item = self._node_items.pop(nid, None)
             if item:
                 self.removeItem(item)
             self.tree.remove_node(nid)
-        self._rebuild_edges()
+        self._rebuild_role_map()
         self._update_year_rows()
         self._recalc_scene_rect()
         self.tree_changed.emit()
@@ -904,7 +990,11 @@ class LineageScene(QGraphicsScene):
             lineage_images.mark_images_authoritative(self.tree, node.id)
             item = self._add_node_item(node)
             item.setSelected(True)
-        self._rebuild_edges(); self._update_year_rows(); self._recalc_scene_rect()
+        for nd in new_nodes:
+            node = self.tree.nodes.get(nd["id"])
+            if node is not None:
+                self._add_edges_for_child(node)
+        self._update_year_rows(); self._recalc_scene_rect()
         self.tree_changed.emit()
         return len(new_nodes)
 
@@ -997,36 +1087,55 @@ class LineageScene(QGraphicsScene):
                 rows.append([n])
         rows.sort(key=lambda r: r[0].y)
 
-        # ── 2. Barycenter sweep (top-down then bottom-up, 6 passes) ──
-        # Precompute parent → children once instead of rescanning every node
-        # for every node on every pass (was O(n² × 6)).
+        # ── 2. Barycenter sweep (top-down then bottom-up, up to 6 passes) ──
+        # Work on explicit positions updated after every row sort; using the
+        # nodes' original x values made passes 2-6 no-ops.
         children_of: Dict[str, List[PlantNode]] = {}
         for c in nodes:
             for pid in c.parent_ids:
                 if pid in id_to:
                     children_of.setdefault(pid, []).append(c)
 
+        work_x: Dict[str, float] = {}
+        for row in rows:
+            row.sort(key=lambda n: n.x)
+            for i, n in enumerate(row):
+                work_x[n.id] = i * H_GAP
+
+        def set_row_pos(row: List[PlantNode]) -> None:
+            for i, n in enumerate(row):
+                work_x[n.id] = i * H_GAP
+
         def barycenter_up(row: List[PlantNode]) -> List[PlantNode]:
             """Sort row nodes by average X of their parents (row above)."""
             def bc(n: PlantNode) -> float:
-                pxs = [id_to[pid].x for pid in n.parent_ids if pid in id_to]
-                return sum(pxs)/len(pxs) if pxs else n.x
+                pxs = [work_x[pid] for pid in n.parent_ids if pid in id_to]
+                return sum(pxs)/len(pxs) if pxs else work_x[n.id]
             return sorted(row, key=bc)
 
         def barycenter_down(row: List[PlantNode]) -> List[PlantNode]:
             """Sort row nodes by average X of their children (row below)."""
             def bc(n: PlantNode) -> float:
                 children = children_of.get(n.id)
-                return sum(c.x for c in children)/len(children) if children else n.x
+                return sum(work_x[c.id] for c in children)/len(children) if children else work_x[n.id]
             return sorted(row, key=bc)
 
         for _pass in range(6):
-            # Top-down: fix upper rows, pull lower by parent barycenters
+            changed = False
             for i in range(1, len(rows)):
-                rows[i] = barycenter_up(rows[i])
-            # Bottom-up: fix lower rows, pull upper by child barycenters
+                new_row = barycenter_up(rows[i])
+                if [n.id for n in new_row] != [n.id for n in rows[i]]:
+                    changed = True
+                rows[i] = new_row
+                set_row_pos(rows[i])
             for i in range(len(rows) - 2, -1, -1):
-                rows[i] = barycenter_down(rows[i])
+                new_row = barycenter_down(rows[i])
+                if [n.id for n in new_row] != [n.id for n in rows[i]]:
+                    changed = True
+                rows[i] = new_row
+                set_row_pos(rows[i])
+            if not changed:
+                break
 
         # ── 3. Re-spread each row evenly around its current centre ──
         for row in rows:
@@ -1057,7 +1166,6 @@ class LineageScene(QGraphicsScene):
                         it = self._node_items.get(pid)
                         if it: it.setPos(id_to[pid].x, id_to[pid].y)
 
-        for e in self._edges: e.update_path()
         self._update_year_rows(); self._recalc_scene_rect()
         self.tree_changed.emit()
 
@@ -1108,7 +1216,6 @@ class LineageScene(QGraphicsScene):
                         it = self._node_items.get(pid)
                         if it: it.setPos(id_to[pid].x, id_to[pid].y)
 
-        for e in self._edges: e.update_path()
         self._update_year_rows(); self._recalc_scene_rect()
         self.tree_changed.emit()
 

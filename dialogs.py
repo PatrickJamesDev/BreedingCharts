@@ -39,15 +39,20 @@ class AutocompleteDB:
     _names:     List[str] = []
     _species:   List[str] = []
     _cultivars: List[str] = []
+    _revision:  int = -1
 
     @classmethod
     def load_from_plant_db(cls) -> None:
         try:
             import plant_db
+            rev = plant_db.get_revision()
+            if rev == cls._revision:
+                return
             all_plants = plant_db.get_all()
             cls._names     = sorted(set(p.name     for p in all_plants if p.name))
             cls._species   = sorted(set(p.species  for p in all_plants if p.species))
             cls._cultivars = sorted(set(p.cultivar for p in all_plants if p.cultivar))
+            cls._revision  = rev
         except Exception as e:
             log.warning("AutocompleteDB.load: %s", e)
 
