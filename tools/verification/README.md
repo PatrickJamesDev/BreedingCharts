@@ -22,4 +22,5 @@ and never touch your real data. Timings are machine dependent; compare ratios, n
 | verify_d3 | save-time metadata cache (F61) and zoom cache suspend/resume (F62) |
 | verify_f1 | open does not write (F7), settings coalescing (F29), stale decode token (F15), revision skip (F26), sheet parents (F10), remove_many (F27), fit_view (F45) |
 | verify_g1 | scaled JPEG thumbnail decode and photo format choice (F22/F51) |
-| verify_perf2 | `.plf.meta` sidecar/stale fallback (F30), incremental connect/disconnect/remove edges vs full rebuild (F42) |
+| verify_perf2 | `.plf.meta` sidecar/stale fallback (F30), incremental connect/disconnect/remove edges vs full rebuild (F42), per-child role edge colours (F12) |
+| verify_undo | lightweight drag snapshot, in-place undo of drag/edit/add/delete, card and pixmap retention (F43/F64) |

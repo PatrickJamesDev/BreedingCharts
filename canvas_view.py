@@ -43,6 +43,8 @@ from settings import THEMES, AppSettings
 import perf
 
 log = logging.getLogger(__name__)
+
+_AL_VCENTER = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
 _DARK = THEMES["dark"]
 
 HANDLE_SIZE = 14
@@ -769,7 +771,7 @@ class LineageScene(QGraphicsScene):
                     item.update()
 
     def _on_node_move_start(self, _: str) -> None:
-        self._push_undo()
+        self._push_position_undo()
 
     def _on_node_moved(self, node_id: str) -> None:
         if getattr(self, "_bulk_move", False):
@@ -820,6 +822,11 @@ class LineageScene(QGraphicsScene):
 
     # ── Undo ──────────────────────────────────────────────────────────────────
 
+    def _append_undo(self, entry: dict) -> None:
+        self._undo_stack.append(entry)
+        if len(self._undo_stack) > 50:
+            self._undo_stack.pop(0)
+
     def _push_undo(self) -> None:
         if self._undoing or not self.tree: return
         state = self.tree.to_dict()
@@ -829,24 +836,118 @@ class LineageScene(QGraphicsScene):
         # on every drag start, and was a measurable stall on large lineages.
         # Pushing a duplicate snapshot is harmless; undo simply restores the
         # same state, and the stack is capped at 50 entries below.
-        self._undo_stack.append({
+        self._append_undo({
             "tree": state,
             "touched_images": set(self.tree._image_loaded_ids),
         })
-        if len(self._undo_stack) > 50: self._undo_stack.pop(0)
+
+    def _push_position_undo(self) -> None:
+        """Drag undo needs only x/y, not a copy of the whole photo-rich tree."""
+        if self._undoing or not self.tree: return
+        self._append_undo({
+            "positions": {nid: (n.x, n.y) for nid, n in self.tree.nodes.items()},
+            "modified_at": self.tree.modified_at,
+            "touched_images": set(self.tree._image_loaded_ids),
+        })
 
     def undo(self) -> None:
         if not self._undo_stack or not self.tree: return
-        from models import LineageTree as LT
         entry = self._undo_stack.pop()
+        positions = entry.get("positions")
+        if positions is not None:
+            for nid, (x, y) in positions.items():
+                node = self.tree.nodes.get(nid)
+                item = self._node_items.get(nid)
+                if node is None:
+                    continue
+                node.x = x; node.y = y
+                if item is not None and (item.pos().x() != x or item.pos().y() != y):
+                    item.setPos(x, y)
+            self.tree.modified_at = entry.get("modified_at", self.tree.modified_at)
+            self._recalc_scene_rect()
+            self.tree_changed.emit()
+            return
+        from models import LineageTree as LT
         old_tree = LT.from_dict(entry["tree"])
         old_tree._image_loaded_ids = set(entry.get("touched_images", ()))
         self._undoing = True
         try:
-            self.load_tree(old_tree)
+            self._restore_tree(old_tree)
         finally:
             self._undoing = False
         self.tree_changed.emit()
+
+    @staticmethod
+    def _node_equal(a: PlantNode, b: PlantNode, ignore_pos: bool = False) -> bool:
+        if ignore_pos:
+            return (a.id == b.id and a.name == b.name and a.species == b.species and
+                    a.cultivar == b.cultivar and a.description == b.description and
+                    a.year == b.year and len(a.images) == len(b.images) and
+                    a.thumb == b.thumb and a.photo_count == b.photo_count and
+                    a.parent_ids == b.parent_ids and a.parent_roles == b.parent_roles and
+                    a.tags == b.tags and a.color == b.color and a.notes == b.notes and
+                    a.created_at == b.created_at)
+        return (a.x == b.x and a.y == b.y and
+                LineageScene._node_equal(a, b, ignore_pos=True))
+
+    def _restore_tree(self, old_tree: "LineageTree") -> None:
+        """Undo by diffing nodes instead of rebuilding the whole scene.
+
+        A drag changes only x/y, so the common undo case is a setPos() per
+        node; cards and decoded thumbnails survive.  Adds/removes still touch
+        only the affected items, and edges are rebuilt once at the end.
+        """
+        old_nodes = old_tree.nodes
+        removed = [nid for nid in self._node_items if nid not in old_nodes]
+        if removed:
+            self._remove_edges_for_nodes(set(removed))
+            for nid in removed:
+                item = self._node_items.pop(nid, None)
+                if item is not None:
+                    self.removeItem(item)
+
+        for nid, node in old_nodes.items():
+            item = self._node_items.get(nid)
+            if item is None:
+                item = self._add_node_item(node)
+                if self.show_images:
+                    self._enqueue_decode(item, priority=10)
+                continue
+            old_node = item.node
+            pos_only = self._node_equal(old_node, node, ignore_pos=True)
+            item.node = node
+            if pos_only:
+                if item.pos().x() != node.x or item.pos().y() != node.y:
+                    item.setPos(node.x, node.y)
+                continue
+            reuse_pixmap = (old_node.thumb == node.thumb and item._pixmap is not None
+                            and not item._pixmap_dirty and not item._decode_pending)
+            pixmap = item._pixmap
+            item.setPos(node.x, node.y)
+            item.refresh()
+            if reuse_pixmap:
+                item._pixmap = pixmap
+                item._pixmap_dirty = False
+                item._decode_pending = False
+
+        self.tree = old_tree
+        self._rebuild_edges()
+
+        for cid in list(self._comment_items):
+            if cid not in old_tree.comments:
+                item = self._comment_items.pop(cid)
+                self.removeItem(item)
+        for cid, note in old_tree.comments.items():
+            item = self._comment_items.get(cid)
+            if item is None:
+                self._add_comment_item(note)
+            else:
+                item._note = note
+                item.setPos(note.x, note.y)
+                item.update()
+
+        self._update_year_rows()
+        self._recalc_scene_rect()
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
 
@@ -863,8 +964,9 @@ class LineageScene(QGraphicsScene):
         self._update_year_rows(); self._recalc_scene_rect()
         self.tree_changed.emit()
 
-    def update_node(self, node: PlantNode) -> None:
-        self._push_undo()
+    def update_node(self, node: PlantNode, record_undo: bool = True) -> None:
+        if record_undo:
+            self._push_undo()
         item = self._node_items.get(node.id)
         if item:
             item.refresh()
@@ -875,7 +977,7 @@ class LineageScene(QGraphicsScene):
             # parent and its colour changed.
             for e in self._node_edge_index.get(node.id, []):
                 if e.parent_item is item:
-                    role = self._role_map.get(node.id, "")
+                    role = e.child_item.node.parent_roles.get(node.id, "")
                     if self.color_code_lines and role == "mother":
                         e.set_color(self.mother_line_color)
                     elif self.color_code_lines and role == "father":
@@ -1404,7 +1506,7 @@ class LineageView(QGraphicsView):
             for year, scene_y in self._sorted_year_rows(year_rows):
                 vy = self.mapFromScene(QPointF(0, scene_y)).y()
                 painter.drawText(QRectF(4, vy-18, YEAR_LABEL_W-8, 36),
-                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                                 _AL_VCENTER,
                                  str(year))
                 painter.setPen(self._year_dash_pen)
                 painter.drawLine(YEAR_LABEL_W, int(vy), self.viewport().width(), int(vy))
@@ -1919,7 +2021,7 @@ class LineageView(QGraphicsView):
                 # Convert scene Y to pixel Y
                 iy = int((scene_y - src_rect.top()) * s)
                 painter.drawText(QRectF(4, iy - 18, lc_px - 8, 36),
-                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                                 _AL_VCENTER,
                                  str(year))
                 painter.setPen(QPen(QColor(self._year_line_col), 1, Qt.PenStyle.DashLine))
                 painter.drawLine(lc_px, iy, out_w, iy)
@@ -1961,8 +2063,7 @@ class LineageView(QGraphicsView):
                         text_w + pill_pad,
                         text_h + pill_pad,
                     ),
-                    Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                    wm_text,
+                    _AL_VCENTER, wm_text,
                 )
 
             painter.end()

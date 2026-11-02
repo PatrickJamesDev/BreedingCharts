@@ -24,12 +24,15 @@ None has been run on a real Windows desktop with your data. **Back up your data 
 | F26 | plant_db.py, grid_view.py | metadata revision counter wired in; grid skips rebuild when the DB is unchanged |
 | F27 | grid_view.py | bulk deletes use one `remove_many` transaction |
 | F11 | canvas_view.py | barycenter sweep uses working positions updated after every row sort, so later passes actually improve crossings; stops early when stable |
+| F12 | canvas_view.py | recolouring a parent's outgoing edges reads each child's mother/father role (a plant can be mother in one cross, father in another) |
 | F28 | ui_main.py | lineage-side upserts evict the plant's base64 image list after the DB rows are flushed (saves RAM; no feature change) |
 | F29 | ui_main.py | settings writes coalesced (500 ms); direct write on dialog accept and on close |
 | F30 | database.py, data_bundle.py, ui_main.py | atomic `<file>.plf.meta` sidecar; sidebar metadata reads ~1 ms even for 46 MB files, with mtime fallback and deletion on lineage delete |
+| F34/F35 | node_item.py, canvas_view.py | hoisted Qt alignment flags; per-card elided-text and advance caches cleared on font/style refresh |
 | F37/F38 | grid_view.py | keep thumbnails on theme change; skip re-flow when column count unchanged |
 | F39 | grid_view.py | image-decode queue uses `collections.deque.popleft()` (O(1) instead of O(n)) |
 | F42 | canvas_view.py | connect/disconnect/remove/delete/paste update only affected edges instead of rebuilding all N edges |
+| F43/F64 | canvas_view.py, ui_main.py | drag undo stores only node positions; full undo diffs nodes in place, keeps card items and decoded thumbnails, and the edit dialog snapshots before mutation |
 | F44 | canvas_view.py | arrow path and 12 px hit shape cached per edge; QBrush created lazily (no per-frame/per-edge allocation) |
 | F45 | canvas_view.py | `fit_view` iterates node items, not `scene.items()` |
 | F46 | canvas_view.py | comment drag/resize emits one `tree_changed` on release instead of every mouse-move |
@@ -51,7 +54,7 @@ Optional dependency: `pip install orjson` (much faster saves; falls back to stre
 
 ## NOT included (design changes with higher regression risk — see the document)
 Thumbnail/metadata split (F24), per-node image store (F31), virtualised grid (F33), `upsert_many`,
-undo diffing (F64), role-map key (F12), card stylesheet consolidation (F32), build_exe changes (F53),
+card stylesheet consolidation (F32), build_exe changes (F53), full role-map keying (F12 card badge; edge colours are fixed),
 IMG_SCALE reduction (F21, a visual-quality trade-off), enum/elide micro-caches (F34/F35),
 grid decode pool and per-card event-filter removal (F39/F40 remainder).
 

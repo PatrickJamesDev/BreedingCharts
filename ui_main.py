@@ -1556,8 +1556,9 @@ class MainWindow(QMainWindow):
                 break
 
         dlg = PlantDialog(node, self, initial_role=initial_role)
+        self._scene._push_undo()
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._scene.update_node(node)
+            self._scene.update_node(node, record_undo=False)
             # Only update the DB if this node's UUID is already a DB entry.
             # Lineage-only clones (e.g. from an older app version that used
             # clone_for_lineage with a new UUID) must NOT create new DB entries
@@ -1578,6 +1579,9 @@ class MainWindow(QMainWindow):
 
             if self._tree: self._props.update_node(node, self._tree)
             self._status(f"Updated: {node.name}")
+        elif self._scene._undo_stack:
+            # Dialog cancelled without committing: drop the pre-edit snapshot.
+            self._scene._undo_stack.pop()
 
     def _delete_selected(self) -> None:
         if not self._tree: return

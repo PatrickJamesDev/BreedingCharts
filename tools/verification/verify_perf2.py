@@ -61,4 +61,23 @@ check("incremental disconnect")
 sc.remove_node(d.id)
 check("incremental remove_node")
 print("F42 incremental edge operations: OK")
+
+# F12: a parent's two edges follow each child's role, even if the parent is
+# mother for one cross and father for another.
+sc2 = LineageScene()
+sc2.color_code_lines = True
+sc2.mother_line_color = "#ff0000"
+sc2.father_line_color = "#0000ff"
+tr2 = LineageTree(name="Roles")
+pnode = PlantNode(name="Parent")
+c1 = PlantNode(name="Child1"); c2 = PlantNode(name="Child2")
+c1.parent_ids = [pnode.id]; c1.parent_roles = {pnode.id: "mother"}
+c2.parent_ids = [pnode.id]; c2.parent_roles = {pnode.id: "father"}
+for n in (pnode, c1, c2): tr2.nodes[n.id] = n
+sc2.load_tree(tr2)
+pnode.color = "#123456"
+sc2.update_node(pnode)
+colors = {e.child_item.node.name: e._color for e in sc2._edges}
+assert colors["Child1"] == "#ff0000" and colors["Child2"] == "#0000ff", colors
+print("F12 per-edge parent role colours: OK")
 os._exit(0)

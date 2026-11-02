@@ -49,6 +49,9 @@ CARD_H_IMG    = HEADER_H + IMG_H + 8 + _TEXT_BLOCK_H
 CARD_H_PLAIN  = HEADER_H + 44 + _TEXT_BLOCK_H
 
 NO_PEN = QPen(Qt.PenStyle.NoPen)
+_AL_TOP_WRAP = (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop |
+                Qt.TextFlag.TextWordWrap)
+_AL_VCENTER = Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
 
 # ── Pre-built paint resources ─────────────────────────────────────────────────
 # These immutable value objects are shared by every card.  Building them once at
@@ -238,6 +241,8 @@ class PlantNodeItem(QGraphicsItem):
         self._fm_badge:   Optional["QFontMetrics"] = None
         self._fm_year:    Optional["QFontMetrics"] = None
         self._fm_tag:     Optional["QFontMetrics"] = None
+        self._elide_cache:   dict = {}
+        self._advance_cache: dict = {}
         self._fonts_dirty: bool = True
         self._last_cf:  str = ""
         self._last_cfs: int = 0
@@ -275,6 +280,24 @@ class PlantNodeItem(QGraphicsItem):
         self._img_clip_cache   = None
         self._img_clip_cache_h = -1
         self._fonts_dirty   = True
+        self._elide_cache.clear()
+        self._advance_cache.clear()
+
+    def _elided(self, fm, text: str, width: int) -> str:
+        key = (id(fm), text, width)
+        val = self._elide_cache.get(key)
+        if val is None:
+            val = fm.elidedText(text, Qt.TextElideMode.ElideRight, width)
+            self._elide_cache[key] = val
+        return val
+
+    def _advance(self, fm, text: str) -> int:
+        key = (id(fm), text)
+        val = self._advance_cache.get(key)
+        if val is None:
+            val = fm.horizontalAdvance(text)
+            self._advance_cache[key] = val
+        return val
 
     def _get_cached_palette(self) -> dict:
         if self._palette_cache is None:
@@ -462,6 +485,8 @@ class PlantNodeItem(QGraphicsItem):
         self._decode_pending = False  # cancel queued decode; next paint reloads immediately
         self._card_h_cache   = None   # image presence may have changed
         self._fonts_dirty    = True
+        self._elide_cache.clear()
+        self._advance_cache.clear()
         self._palette_cache  = None
         self._pen_cache      = None
         self._brush_cache    = None
@@ -657,8 +682,7 @@ class PlantNodeItem(QGraphicsItem):
         name_h    = max(name_line + 10, name_line * 2 + 4)   # room for 2 lines
         name_rect = QRectF(tx, y, tw, name_h)
         painter.drawText(name_rect,
-                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop |
-                         Qt.TextFlag.TextWordWrap,
+                         _AL_TOP_WRAP,
                          self.node.name or "Unnamed")
         y += name_h
 
@@ -671,10 +695,9 @@ class PlantNodeItem(QGraphicsItem):
             painter.setPen(self._pen_cache["text_muted"])
             sp_text = self.node.species
             # Elide if still too wide for one line
-            sp_text = fm_sp.elidedText(sp_text, Qt.TextElideMode.ElideRight, int(tw))
+            sp_text = self._elided(fm_sp, sp_text, int(tw))
             painter.drawText(sp_rect,
-                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                             sp_text)
+                             _AL_VCENTER, sp_text)
             y += sp_h
 
         # Mother/Father role badge — role already read above from O(1) map
@@ -692,7 +715,7 @@ class PlantNodeItem(QGraphicsItem):
             painter.setFont(self._font_badge)
             fm_badge = self._fm_badge  # cached
             badge_h  = fm_badge.height() + 6
-            badge_w  = max(72, fm_badge.horizontalAdvance(role_label) + 16)
+            badge_w  = max(72, self._advance(fm_badge, role_label) + 16)
             badge    = QRectF(tx, y, badge_w, badge_h)
             role_key = "mother" if "Mother" in role_label else "father"
             painter.setBrush(_ROLE_BADGE_BRUSHES[role_key])
@@ -708,7 +731,7 @@ class PlantNodeItem(QGraphicsItem):
             painter.setFont(self._font_year)
             fm_year  = self._fm_year   # cached
             badge_h  = fm_year.height() + 6
-            badge_w  = max(52, fm_year.horizontalAdvance(str(self.node.year)) + 16)
+            badge_w  = max(52, self._advance(fm_year, str(self.node.year)) + 16)
             badge    = QRectF(tx, y, badge_w, badge_h)
             painter.setBrush(self._brush_cache["year_bg"])
             painter.setPen(NO_PEN)
@@ -725,8 +748,8 @@ class PlantNodeItem(QGraphicsItem):
             tag_h  = fm_tag.height() + 6
             txp    = tx
             for tag in self.node.tags[:6]:
-                lbl  = fm_tag.elidedText(tag, Qt.TextElideMode.ElideRight, 110)
-                tw2  = fm_tag.horizontalAdvance(lbl) + 14
+                lbl  = self._elided(fm_tag, tag, 110)
+                tw2  = self._advance(fm_tag, lbl) + 14
                 tw2  = min(tw2, 110)
                 if txp + tw2 > CARD_W/2 - TEXT_PAD:
                     break
