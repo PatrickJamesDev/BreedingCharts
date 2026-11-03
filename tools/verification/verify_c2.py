@@ -26,6 +26,7 @@ for N in (1000,3000):
         for e in lst:
             pass
     print(f"N={N}: load_tree {b*1000:.0f} ms | auto_layout {al*1000:.0f} ms | auto_organize {ao*1000:.0f} ms")
+    assert sc.itemIndexMethod() == QGraphicsScene.ItemIndexMethod.BspTreeIndex
 # correctness: edge geometry after layout equals fresh rebuild
 from canvas_view import EdgeItem
 def sig():

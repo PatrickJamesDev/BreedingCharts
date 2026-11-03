@@ -573,6 +573,9 @@ class _CardTextArea(QWidget):
         p.end()
 
 
+_CHROME_CACHE: dict = {}
+
+
 class MiniPlantCard(QFrame):
     """A compact visual card representing one plant."""
     edit_requested           = pyqtSignal(object)   # PlantNode
@@ -834,15 +837,21 @@ class MiniPlantCard(QFrame):
         bg       = self._pal.get("node_bg",    "#1a2a1e")
         border   = self._pal.get("node_border","#2e4a34")
         panel_bg = self._pal.get("panel_bg2",  "#1c2a1c")
-        bw = 2
-        if selected:
-            border, bw = accent, 3
-            bg, panel_bg = QColor(accent).darker(300), QColor(accent).darker(350)
-        elif hovered:
-            border = accent
-        self._chrome = (QColor(bg), QColor(border), bw)
+        key = (accent, bg, border, panel_bg, selected, hovered)
+        chrome = _CHROME_CACHE.get(key)
+        if chrome is None:
+            bw = 3 if selected else 2
+            if selected:
+                bg_c, border_c = QColor(accent).darker(300), QColor(accent)
+                panel_c = QColor(accent).darker(350)
+            else:
+                bg_c, border_c = QColor(bg), QColor(accent if hovered else border)
+                panel_c = QColor(panel_bg)
+            chrome = (bg_c, border_c, bw, panel_c)
+            _CHROME_CACHE[key] = chrome
+        self._chrome = (chrome[0], chrome[1], chrome[2])
         if hasattr(self, "_text_area"):
-            self._text_area.set_color(QColor(panel_bg))
+            self._text_area.set_color(chrome[3])
         self.update()
 
     def paintEvent(self, event) -> None:

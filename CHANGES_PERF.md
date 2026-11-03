@@ -47,7 +47,7 @@ None has been run on a real Windows desktop with your data. **Back up your data 
 | F61 | database.py | sidebar metadata cache filled at save time (no re-parse of the saved file) |
 | F62 | canvas_view.py | item caches suspended while zooming, resumed after 180 ms idle |
 | F63 | ui_main.py | sidebar keeps a `{path: row}` map for O(1) `touch_file_row` updates |
-| F65 | grid_view.py | card chrome painted in paintEvent instead of setStyleSheet/polish |
+| F65 | grid_view.py | card chrome painted in paintEvent instead of setStyleSheet/polish; selected/hover QColors are shared across all cards instead of rebuilt per card |
 | F66 | settings.py | removed unused undo-history persistence |
 
 Optional dependency: `pip install orjson` (much faster saves; falls back to streamed json without it).
