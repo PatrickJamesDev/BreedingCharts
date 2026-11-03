@@ -93,6 +93,12 @@ photo_cards = [c for c in g._card_cache.values() if c.plant.has_photo]
 assert photo_cards
 assert all(c._image_loaded and c._img_lbl.pixmap() is not None
            and not c._img_lbl.pixmap().isNull() for c in photo_cards)
+photo_thumb = (photo_cards[0].plant.thumb
+               or photo_cards[0]._prefetched_thumb
+               or plant_db.get_thumb(photo_cards[0].plant.id))
+assert photo_thumb
+assert (photo_cards[0]._thumbnail_cache_key(photo_thumb)
+        != photo_cards[0]._thumbnail_cache_key(photo_thumb + "x"))
 print(f"F33 export decoded {len(photo_cards)} off-screen photo card(s) before grab")
 g._restore_viewport_window()
 os._exit(0)

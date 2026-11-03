@@ -631,6 +631,7 @@ class MiniPlantCard(QFrame):
         # _load_image() asynchronously to avoid a synchronous burst on load.
         self._img_lbl.setText("🌿")
         self._img_lbl.setFont(QFont("Segoe UI", 28))
+        self._placeholder_styled = False
         # Purely decorative — without this, a click anywhere on the photo
         # (i.e. almost the whole card) is delivered to this QLabel instead
         # of bubbling to MiniPlantCard, so mousePressEvent/set_selected()
@@ -756,8 +757,9 @@ class MiniPlantCard(QFrame):
         if role_label:
             role_col = "#e87060" if "Mother" in role_label else "#60a0e8"
             self._role_lbl.setText(role_label)
-            self._role_lbl.setStyleSheet(
-                f"color: {role_col}; background: transparent;")
+            role_style = f"color: {role_col}; background: transparent;"
+            if self._role_lbl.styleSheet() != role_style:
+                self._role_lbl.setStyleSheet(role_style)
             self._role_lbl.show()
         else:
             self._role_lbl.hide()
@@ -818,21 +820,35 @@ class MiniPlantCard(QFrame):
     def _emit_add_to_lineage(self) -> None:
         self.add_to_lineage_requested.emit(self.plant)
 
+    def _thumbnail_cache_key(self, b64: Optional[str]) -> str:
+        # Include a content signature: editing a photo can change its
+        # thumbnail without changing the plant ID, and the old key would
+        # otherwise keep serving the previous pixmap.
+        sig = f":{len(b64)}:{b64[:12]}:{b64[-12:]}" if b64 else ""
+        return f"thumb:{self.plant.id}:{CARD_W}x{IMG_H}{sig}"
+
     def _load_image(self) -> None:
         import plant_db as _pdb
         if not self.plant.has_photo:
             self._show_placeholder()
             return
 
-        cache_key = f"thumb:{self.plant.id}:{CARD_W}x{IMG_H}"
+        b64_hint = self.plant.thumb or self._prefetched_thumb
+        cache_key = self._thumbnail_cache_key(b64_hint)
         cached = QPixmapCache.find(cache_key)
         if cached is not None and not cached.isNull():
             self._img_lbl.setPixmap(cached)
             self._image_loaded = True
             return
 
-        b64 = (self.plant.thumb or self._prefetched_thumb
-               or _pdb.get_thumb(self.plant.id))
+        b64 = b64_hint or _pdb.get_thumb(self.plant.id)
+        if b64 and b64 is not b64_hint:
+            cache_key = self._thumbnail_cache_key(b64)
+            cached = QPixmapCache.find(cache_key)
+            if cached is not None and not cached.isNull():
+                self._img_lbl.setPixmap(cached)
+                self._image_loaded = True
+                return
         using_full_res = False
         if not b64:
             # Legacy plant saved before thumbnails existed — fall back to
@@ -889,10 +905,11 @@ class MiniPlantCard(QFrame):
 
     def _show_placeholder(self) -> None:
         self._img_lbl.setText("🌿")
-        self._img_lbl.setFont(QFont("Segoe UI", 28))
-        self._img_lbl.setStyleSheet(
-            f"background: {self._pal.get('placeholder','#1e2e22')}; "
-            f"color: {self._pal.get('placeholder_icon','#3a6040')}; border-radius: 0px;")
+        if not self._placeholder_styled:
+            self._img_lbl.setStyleSheet(
+                f"background: {self._pal.get('placeholder','#1e2e22')}; "
+                f"color: {self._pal.get('placeholder_icon','#3a6040')}; border-radius: 0px;")
+            self._placeholder_styled = True
         self._image_loaded = True
 
     def _apply_style(self, hovered: bool, selected: bool) -> None:
@@ -1946,7 +1963,8 @@ class PlantGridView(QWidget):
                 card._prefetched_thumb = prefetched
             # Keep earlier measured row height so scrolling never causes a
             # jarring vertical jump when a tall card leaves the viewport.
-            card.setMinimumHeight(row_h)
+            if card.minimumHeight() != row_h:
+                card.setMinimumHeight(row_h)
             card.set_selected(pid in self._row_selected)
             self._grid_layout.addWidget(card, r, c)
             cards.append(card)

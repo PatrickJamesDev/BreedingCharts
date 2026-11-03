@@ -1509,7 +1509,7 @@ All numbers from the same sandbox; variance between runs on this shared machine 
 | Save of a 46 MB lineage | 535–570 ms (no fsync) | \~100–450 ms (with fsync, atomic) |
 | UI-thread parse after each background save (46 MB) | 113–132 ms | 0 |
 
-Post-audit implementation measurements (current repo, 600 plants / 80 notes / 120 lineage nodes unless noted, offscreen 1400×900): grid scroll 60 px × 40 steps 38.5 ms median (first 161.8 ms); 50% scroll jump + settle 30.6 ms (first 82.4 ms); 1,500 plants stay at 18 live cards with a 41,114 px scroll extent; a 120-plant export rendered 1,892×3,646 px, restored 45 live cards and decoded 3 off-screen photos; `save_lineage` 17.8 ms and `load_lineage` 3.1 ms. These replace the earlier grid and persistence estimates where they conflict.
+Post-audit implementation measurements (current repo, 600 plants / 80 notes / 120 lineage nodes unless noted, offscreen 1400×900): grid scroll 60 px × 40 steps 19.9 ms median (first 155.8 ms); 50% scroll jump + settle 11.0 ms (first 57.5 ms); `_rebuild_grid` 1.5 ms warm; 1,500 plants stay at 18 live cards with a 41,114 px scroll extent; a 120-plant export rendered 1,892×3,646 px, restored 45 live cards and decoded 3 off-screen photos; `save_lineage` 16.8 ms and `load_lineage` 3.8 ms. These replace the earlier grid and persistence estimates where they conflict.
 
 ### 17.4 What to do next, in order
 
