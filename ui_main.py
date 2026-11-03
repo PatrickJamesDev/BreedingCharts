@@ -1827,6 +1827,8 @@ class MainWindow(QMainWindow):
         # authoritative in the lineage's own lazy-image tracking whenever
         # node.images/thumb is set, so the sidecar merge on save picks it up.)
         plant_db.populate_images(node)
+        if not node.thumb:
+            node.thumb = plant_db.get_thumb(node.id)
         vr = self._view.mapToScene(self._view.viewport().rect()).boundingRect()
         node.x = vr.center().x(); node.y = vr.center().y()
         self._scene.add_node(node); self._update_node_count()

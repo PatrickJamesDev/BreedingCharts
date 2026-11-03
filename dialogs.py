@@ -928,7 +928,8 @@ class PlantDBDialog(FadeDialog):
     def _on_select(self, row: int) -> None:
         if row < 0 or row >= len(self._filtered): return
         p = self._filtered[row]
-        b64 = p.thumb or (p.images[0] if p.images else None)
+        import plant_db as _pdb
+        b64 = p.thumb or _pdb.get_thumb(p.id) or (p.images[0] if p.images else None)
         if b64:
             pix = _b64_to_pixmap(b64)
             if pix:

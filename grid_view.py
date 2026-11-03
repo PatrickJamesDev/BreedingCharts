@@ -2,9 +2,10 @@
 grid_view.py — Full-screen grid view of every plant in the database.
 
 Performance fixes:
-  • _card_cache: MiniPlantCard widgets are reused across sort/filter rebuilds.
-    Only brand-new plants get a new card; existing ones are simply re-placed in
-    the layout. Removes the O(n) card-construction cost on every sort change.
+  • The card grid is virtualised: only rows intersecting the viewport (plus
+    a two-row buffer) materialise MiniPlantCard widgets. Off-screen rows use
+    one lightweight placeholder, so 1,500+ plants no longer mean 12,000+
+    live widgets. Cards are destroyed when scrolled away, keeping RAM bounded.
   • Role labels are pre-computed once per rebuild (O(n)) instead of each card
     calling plant_db.get_all() independently (was O(n²)).
 
@@ -26,7 +27,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QFrame, QSizePolicy,
     QMessageBox, QApplication, QComboBox, QMenu,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QStackedWidget, QTabWidget, QFileDialog,
+    QStackedWidget, QTabWidget, QFileDialog, QSpacerItem,
 )
 from PyQt6.QtGui import QPixmap, QPixmapCache, QColor, QPainter, QFont, QPen, QBrush, QCursor
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal, QPoint, QRectF
@@ -764,7 +765,7 @@ class MiniPlantCard(QFrame):
             self._image_loaded = True
             return
 
-        b64 = self.plant.thumb
+        b64 = self.plant.thumb or _pdb.get_thumb(self.plant.id)
         using_full_res = False
         if not b64:
             # Legacy plant saved before thumbnails existed — fall back to
@@ -793,7 +794,9 @@ class MiniPlantCard(QFrame):
                             import image_utils
                             thumb = image_utils.make_thumb_from_b64(b64)
                             if thumb:
-                                self.plant.thumb = thumb
+                                # Keep the base64 string out of the model:
+                                # it is already in SQLite and the decoded
+                                # QPixmap is in QPixmapCache.
                                 _pdb.set_thumb(self.plant.id, thumb)
                         self._img_lbl.setPixmap(cropped)
                         self._image_loaded = True
@@ -927,15 +930,34 @@ class PlantGridView(QWidget):
         self._sort_by      = sort_mode if sort_mode in ("name", "species", "year", "newest") else "name"
         self._dirty        = True
         self._selected_plants: list = []  # multi-select list
-        # Cache: plant_id -> MiniPlantCard — avoids recreating cards on sort/filter
+        # Only visible (plus a small scroll buffer) cards are real widgets.
+        # Off-screen rows use one lightweight placeholder each, so a database
+        # with thousands of plants no longer builds thousands of QFrames,
+        # labels, buttons and stylesheets.  _card_cache therefore contains
+        # only the currently materialised cards.
         self._card_cache: Dict[str, MiniPlantCard] = {}
-        # Incremental layout build — see _rebuild_grid / _flush_plan.
+        self._row_items: Dict[int, list] = {}
+        self._row_headers: Dict[int, str] = {}
+        self._row_heights: Dict[int, int] = {}
+        self._row_tops: Dict[int, int] = {}
+        self._row_order: list = []
+        self._row_placeholders: Dict[int, QSpacerItem] = {}
+        self._row_cards: Dict[int, list] = {}
+        self._row_roles: Dict[str, str] = {}
+        self._row_selected: set = set()
+        self._active_rows: set = set()
+        self._n_cols: int = 1
+        self._content_height: int = 0
+        self._materializing_all: bool = False
+        self._updating_window: bool = False
+        # Kept for compatibility with the old incremental builder/tests; the
+        # virtualised path never starts it.
         self._plan: list = []
         self._plan_index: int = 0
         self._plan_roles: Dict[str, str] = {}
         self._plan_selected: set = set()
         self._card_build_timer = QTimer(self)
-        self._card_build_timer.setInterval(0)     # fire between event-loop iterations
+        self._card_build_timer.setInterval(0)
         self._card_build_timer.timeout.connect(self._build_next_card_batch)
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
@@ -1018,6 +1040,8 @@ class PlantGridView(QWidget):
         return {
             "cached_card_widgets": len(self._card_cache),
             "all_plants_loaded":   len(self._all_plants),
+            "visible_plant_count": len(getattr(self, "_visible_plants", [])),
+            "materialised_rows":   len(self._active_rows),
         }
 
     def set_lineage_open(self, name: Optional[str]) -> None:
@@ -1122,6 +1146,8 @@ class PlantGridView(QWidget):
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._scroll.installEventFilter(self)
         self._scroll.viewport().installEventFilter(self)
+        self._scroll.verticalScrollBar().valueChanged.connect(
+            self._on_grid_scrolled)
         self._grid_widget = QWidget()
         self._grid_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._grid_widget.customContextMenuRequested.connect(self._canvas_context_menu)
@@ -1316,8 +1342,25 @@ class PlantGridView(QWidget):
         """
         if self._stack.currentIndex() == 1:
             return self._sheet_tabs.grab_full_content()
-        else:
+        # Temporarily materialise every row so the export contains the whole
+        # grid, not just the virtualised viewport.  Restore the window after
+        # grabbing so the memory spike is short-lived.
+        self._card_build_timer.stop()
+        self._materialize_all_rows()
+        try:
+            # Cards created for off-screen rows have not been through the
+            # normal lazy decode queue yet.  Drain it synchronously so the
+            # exported image contains every photo, not placeholders.
+            while self._img_decode_queue:
+                self._decode_next_card()
+            self._grid_layout.activate()
+            self._grid_widget.resize(
+                self._grid_widget.width(),
+                max(self._content_height, self._grid_widget.sizeHint().height()))
+            QApplication.processEvents()
             return self._grid_widget.grab()
+        finally:
+            self._restore_viewport_window()
 
     def _export_grid_png(self) -> None:
         """Export the ENTIRE plant grid / spreadsheet (all rows, not just
@@ -1580,14 +1623,10 @@ class PlantGridView(QWidget):
         import plant_db
         q = self._search.text().strip()
         plants = plant_db.search(q) if q else list(self._all_plants)
-        # plant_db.search() already returns name-sorted results, so the
-        # common "search while sorting by name" path skipped a redundant
-        # full sort here (it previously ran on every keystroke).
         if not (q and self._sort_by == "name"):
             plants = self._sorted_plants(plants)
-        self._visible_plants = plants            # F5: what is actually shown
+        self._visible_plants = plants
 
-        # ── Update live plant count in header ─────────────────────────────────
         total = len(self._all_plants)
         shown = len(plants)
         if q and shown != total:
@@ -1595,30 +1634,14 @@ class PlantGridView(QWidget):
         else:
             self._count_lbl.setText(f"{total} plant{'s' if total != 1 else ''}")
 
-        # Pre-compute roles so each card doesn't need its own DB call
         role_map = self._build_role_map()
-        # Pre-compute selection as a set — the old per-card any() scan was
-        # O(plants × selected) on every rebuild.
         selected_ids = {sp.id for sp in self._selected_plants}
-
-        # Evict cached cards for plants no longer shown.  deleteLater() frees
-        # the widget (and its child labels/buttons/fonts) instead of merely
-        # unparenting it, which otherwise left a hidden top-level widget
-        # alive for every filtered-out plant.
         current_ids = {p.id for p in plants}
-        stale = [pid for pid in list(self._card_cache) if pid not in current_ids]
-        for pid in stale:
-            card = self._card_cache.pop(pid)
-            card.deleteLater()
+        rev = plant_db.get_revision()
+        reuse = getattr(self, "_cards_rev", None) == rev
 
-        # Evict old section header widgets
-        for hw in getattr(self, "_section_headers", []):
-            hw.deleteLater()
-        self._section_headers: list = []
-
-        # Clear layout items WITHOUT destroying widgets (they stay in cache)
-        while self._grid_layout.count():
-            self._grid_layout.takeAt(0)
+        scroll_y = self._scroll.verticalScrollBar().value()
+        self._clear_materialised_grid(current_ids if reuse else ())
 
         if not plants:
             empty = QLabel("No plants found." if q else
@@ -1626,140 +1649,311 @@ class PlantGridView(QWidget):
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty.setStyleSheet(f"color: {self._pal.get('text_muted','#90b898')}; font-size: 14px;")
             self._grid_layout.addWidget(empty, 0, 0)
+            self._grid_widget.setMinimumHeight(0)
             self._count_lbl.setText("")
             return
 
         avail_w = max(self._scroll.viewport().width() - PAD, COL_W)
-        n_cols  = max(1, avail_w // (CARD_W + PAD))
-        self._last_cols = n_cols                  # F38
+        n_cols = max(1, avail_w // (CARD_W + PAD))
+        self._last_cols = n_cols
+        self._n_cols = n_cols
 
-        # ── Determine whether to group into sections ───────────────────────────
-        # Group by genus (first word of species) when sorted by species,
-        # or by year when sorted by year.  Other sort modes show a flat grid.
         do_group = self._sort_by in ("species", "year")
-        key_fn   = self._genus_key if self._sort_by == "species" else self._year_key
+        key_fn = self._genus_key if self._sort_by == "species" else self._year_key
 
-        # ── Build a placement plan, then apply it incrementally ──────────────
-        # Constructing a card is ~1 ms of real work (a dozen widgets, several
-        # stylesheets, a layout).  Doing all of them in one go meant a
-        # multi-second freeze when opening the grid on a large database, so
-        # the plan below is applied in batches: enough for the first screen
-        # synchronously (the view is never blank), the rest across subsequent
-        # event-loop ticks, leaving the UI responsive throughout.
-        plan: list = []
-        grid_row  = 0    # current row in QGridLayout (sections consume whole rows)
-        col       = 0    # current column within the current card row
-        prev_key  = None
+        row_items: Dict[int, list] = {}
+        row_headers: Dict[int, str] = {}
+        grid_row = 0
+        col = 0
+        prev_key = None
         for plant in plants:
             if do_group:
                 gk = key_fn(plant)
                 if gk != prev_key:
-                    if col > 0:          # finish the current card row first
+                    if col > 0:
                         grid_row += 1
                         col = 0
-                    plan.append(("header", gk, grid_row, n_cols))
+                    row_headers[grid_row] = gk
                     grid_row += 1
                     prev_key = gk
-            plan.append(("card", plant, grid_row, col))
+            row_items.setdefault(grid_row, []).append((col, plant))
             col += 1
             if col >= n_cols:
                 col = 0
                 grid_row += 1
 
-        self._plan          = plan
-        self._plan_index    = 0
-        self._plan_roles    = role_map
-        self._plan_selected = selected_ids
+        self._row_items = row_items
+        self._row_headers = row_headers
+        self._row_heights = {r: CARD_H for r in row_items}
+        self._row_roles = role_map
+        self._row_selected = selected_ids
+        self._row_cards = {}
+        self._row_placeholders = {}
+        self._active_rows = set()
+
+        # Build section headers up front (there are far fewer than cards, and
+        # they are tiny), and measure their row height once.
+        self._section_headers = []
+        for r, gk in sorted(row_headers.items()):
+            hw = SectionHeaderWidget(gk, self._pal, parent=self._grid_widget)
+            self._grid_layout.addWidget(hw, r, 0, 1, n_cols)
+            self._section_headers.append(hw)
+            self._row_heights[r] = max(24, hw.sizeHint().height())
+
+        # Placeholders preserve total scroll extent without creating cards.
+        for r, items in row_items.items():
+            self._add_row_placeholder(r)
+
+        self._row_order = sorted(set(self._row_heights) | set(row_items))
+        self._recompute_row_tops()
+        self._scroll.verticalScrollBar().setValue(scroll_y)
+        self._window_rows: tuple = (-1, -1)
+        self._update_visible_rows(force=True)
+        self._cards_rev = rev
+        self._update_selection_badge()
+
+    def _clear_materialised_grid(self, keep_ids=()) -> None:
+        """Destroy old layout, optionally retaining cards for unchanged data.
+
+        Sort/filter rebuilds keep the same plant revisions, so the handful of
+        visible cards can be re-attached instead of rebuilt — the expensive
+        part (a dozen widgets, stylesheets and layouts per card) disappears.
+        """
+        self._img_decode_queue.clear()
+        self._img_decode_timer.stop()
         self._card_build_timer.stop()
-        self._flush_plan(_CARDS_FIRST_PAINT)
-        if self._plan_index < len(self._plan):
-            self._card_build_timer.start()
-        else:
-            self._update_selection_badge()
+        keep = set(keep_ids)
+        keep_cards = set()
+        for pid, card in list(self._card_cache.items()):
+            try:
+                self._grid_layout.removeWidget(card)
+            except Exception:
+                pass
+            if pid in keep:
+                keep_cards.add(card)
+            else:
+                self._card_cache.pop(pid, None)
+                card.hide()
+                card.deleteLater()
+        # apply_card_settings() can clear _card_cache before a rebuild, which
+        # used to leave the old cards parented (and visible) outside the
+        # layout.  Sweep the layout for any card not explicitly kept.
+        for i in range(self._grid_layout.count()):
+            card = self._grid_layout.itemAt(i).widget()
+            if isinstance(card, MiniPlantCard) and card not in keep_cards:
+                card.hide()
+                card.deleteLater()
+        for hw in getattr(self, "_section_headers", []):
+            hw.hide()
+            hw.deleteLater()
+        self._section_headers = []
+        self._row_placeholders.clear()
+        while self._grid_layout.count():
+            self._grid_layout.takeAt(0)
+        self._row_items = {}
+        self._row_headers = {}
+        self._row_heights = {}
+        self._row_tops = {}
+        self._row_order = []
+        self._row_cards = {}
+        self._active_rows = set()
+        self._plan = []
+        self._plan_index = 0
+
+    def _recompute_row_tops(self) -> None:
+        top = PAD
+        for r in self._row_order:
+            self._row_tops[r] = top
+            top += self._row_heights.get(r, CARD_H) + PAD
+        content_height = top + PAD
+        if content_height != self._content_height:
+            self._content_height = content_height
+            self._grid_widget.setMinimumHeight(content_height)
+
+    def _add_row_placeholder(self, r: int) -> None:
+        h = self._row_heights.get(r, CARD_H)
+        ph = self._row_placeholders.get(r)
+        if ph is not None:
+            ph.changeSize(1, h, QSizePolicy.Policy.Minimum,
+                          QSizePolicy.Policy.Fixed)
+            return
+        ph = QSpacerItem(1, h, QSizePolicy.Policy.Minimum,
+                         QSizePolicy.Policy.Fixed)
+        self._grid_layout.addItem(ph, r, 0, 1, self._n_cols)
+        self._row_placeholders[r] = ph
+
+    def _rows_in_viewport(self) -> set:
+        if not self._row_items:
+            return set()
+        vp_h = self._scroll.viewport().height() or self.height()
+        top = self._scroll.verticalScrollBar().value()
+        buffer = CARD_H * 2
+        lo = top - buffer
+        hi = top + vp_h + buffer
+        active = set()
+        for r in self._row_items:
+            ry = self._row_tops.get(r, 0)
+            rh = self._row_heights.get(r, CARD_H)
+            if ry + rh >= lo and ry <= hi:
+                active.add(r)
+        return active
+
+    def _on_grid_scrolled(self, _value: int) -> None:
+        self._update_visible_rows()
+
+    def _update_visible_rows(self, force: bool = False) -> None:
+        if self._materializing_all or not self._row_items:
+            return
+        active = self._rows_in_viewport()
+        if not force and active == self._active_rows:
+            return
+        self._row_selected = {sp.id for sp in self._selected_plants}
+        self._updating_window = True
+        try:
+            for r in list(self._active_rows - active):
+                self._dematerialise_row(r)
+            self._active_rows = active
+            # A full rebuild shows the leading row immediately.  Scrolling
+            # only retargets the pending rows: the next event-loop ticks build
+            # them one row at a time, so a drag never blocks for a whole
+            # window of card construction.
+            missing = [r for r in sorted(active) if r not in self._row_cards]
+            if force and missing and self._materialise_row(missing[0]):
+                self._recompute_row_tops()
+            if any(r not in self._row_cards for r in active):
+                self._card_build_timer.start()
+            else:
+                self._card_build_timer.stop()
+        finally:
+            self._updating_window = False
+
+    def _materialise_row(self, r: int) -> bool:
+        """Create this row's cards; return True if its height changed."""
+        if r in self._row_cards:
+            return False
+        items = self._row_items.get(r)
+        if not items:
+            return False
+        ph = self._row_placeholders.pop(r, None)
+        if ph is not None:
+            self._grid_layout.removeItem(ph)
+        row_h = self._row_heights.get(r, CARD_H)
+        cards = []
+        for c, plant in items:
+            pid = plant.id
+            card = self._card_cache.get(pid)
+            if card is None:
+                card = MiniPlantCard(plant, self._pal,
+                                     role=self._row_roles.get(pid, ""),
+                                     card_font=self._card_font,
+                                     card_font_size=max(6, self._card_font_size - 1),
+                                     parent=self._grid_widget)
+                card.edit_requested.connect(self._edit_plant)
+                card.delete_requested.connect(self._delete_plant)
+                card.add_to_lineage_requested.connect(self.add_to_lineage.emit)
+                card.selected_signal.connect(self._on_card_selected)
+                card.installEventFilter(self)
+                self._card_cache[pid] = card
+            elif card.parent() is not self._grid_widget:
+                card.setParent(self._grid_widget)
+            if card.plant is not plant:
+                card.plant = plant
+                card.setToolTip(
+                    f"{plant.name}\n{plant.species or ''}\n{plant.year or ''}")
+            # Keep earlier measured row height so scrolling never causes a
+            # jarring vertical jump when a tall card leaves the viewport.
+            card.setMinimumHeight(row_h)
+            card.set_selected(pid in self._row_selected)
+            self._grid_layout.addWidget(card, r, c)
+            cards.append(card)
+            if plant.has_photo and not card._image_loaded:
+                self._img_decode_queue.append(card)
+        self._row_cards[r] = cards
+        height_changed = False
+        if cards:
+            measured = max(card.sizeHint().height() for card in cards)
+            if measured > self._row_heights.get(r, CARD_H):
+                self._row_heights[r] = measured
+                height_changed = True
+                for card in cards:
+                    card.setMinimumHeight(measured)
+        if self._img_decode_queue and not self._img_decode_timer.isActive():
+            self._img_decode_timer.start()
+        return height_changed
+
+    def _dematerialise_row(self, r: int) -> None:
+        cards = self._row_cards.pop(r, None)
+        if cards is None:
+            return
+        for card in cards:
+            self._grid_layout.removeWidget(card)
+            try:
+                self._img_decode_queue.remove(card)
+            except ValueError:
+                pass
+            pid = getattr(card.plant, "id", None)
+            if pid and self._card_cache.get(pid) is card:
+                self._card_cache.pop(pid, None)
+            card.hide()
+            card.deleteLater()
+        self._add_row_placeholder(r)
+
+    def _materialize_all_rows(self) -> None:
+        """Temporarily create every card (used only by PNG/PDF export)."""
+        if not self._row_items:
+            return
+        self._card_build_timer.stop()
+        self._row_selected = {sp.id for sp in self._selected_plants}
+        self._materializing_all = True
+        try:
+            for r in sorted(self._row_items):
+                self._materialise_row(r)
+            self._recompute_row_tops()
+        finally:
+            self._materializing_all = False
+
+    def _restore_viewport_window(self) -> None:
+        self._materializing_all = False
+        self._card_build_timer.stop()
+        self._row_selected = {sp.id for sp in self._selected_plants}
+        active = self._rows_in_viewport()
+        for r in list(self._row_cards):
+            if r not in active:
+                self._dematerialise_row(r)
+        for r in sorted(active):
+            self._materialise_row(r)
+        self._active_rows = active
+        self._recompute_row_tops()
+        self._grid_widget.resize(
+            self._grid_widget.width(), self._content_height)
 
     def _flush_plan(self, budget: int) -> None:
-        """Apply queued layout ops, stopping after `budget` newly built cards.
-
-        Cached cards are re-attached freely — only construction is budgeted,
-        since that is the expensive part.
-        """
-        # Selection can change while the remaining cards are still being
-        # built (clicking a card, Ctrl+A), so re-snapshot it each slice
-        # rather than relying on the value captured when the plan was made.
-        self._plan_selected = {sp.id for sp in self._selected_plants}
-
-        built = 0
-        self._grid_widget.setUpdatesEnabled(False)
-        try:
-            while self._plan_index < len(self._plan):
-                op = self._plan[self._plan_index]
-                self._plan_index += 1
-                if self._apply_plan_op(op):
-                    built += 1
-                    if built >= budget:
-                        break
-        finally:
-            self._grid_widget.setUpdatesEnabled(True)
+        """Legacy compatibility shim — the virtualised grid has no plan."""
+        self._update_visible_rows(force=True)
 
     def _apply_plan_op(self, op) -> bool:
-        """Place one queued op.  Returns True if it constructed a new card."""
-        made_card = False
-        if op[0] == "header":
-            _, gk, r, span = op
-            hw = SectionHeaderWidget(gk, self._pal, parent=self._grid_widget)
-            self._grid_layout.addWidget(hw, r, 0, 1, span)
-            self._section_headers.append(hw)
-            return False
-
-        _, plant, r, c = op
-        pid = plant.id
-        card = self._card_cache.get(pid)
-        if card is None:
-            card = MiniPlantCard(plant, self._pal,
-                                 role=self._plan_roles.get(pid, ""),
-                                 card_font=self._card_font,
-                                 card_font_size=max(6, self._card_font_size - 1),
-                                 parent=self._grid_widget)
-            card.edit_requested.connect(self._edit_plant)
-            card.delete_requested.connect(self._delete_plant)
-            card.add_to_lineage_requested.connect(self.add_to_lineage.emit)
-            card.selected_signal.connect(self._on_card_selected)
-            card.installEventFilter(self)
-            self._card_cache[pid] = card
-            made_card = True
-        elif card.parent() is not self._grid_widget:
-            card.setParent(self._grid_widget)
-
-        # plant.has_photo comes from the cached metadata, so this
-        # avoids a plant_db lock + set lookup for every card.
-        if plant.has_photo and not card._image_loaded:
-            self._img_decode_queue.append(card)
-            if not self._img_decode_timer.isActive():
-                self._img_decode_timer.start()
-
-        card.set_selected(pid in self._plan_selected)
-        self._grid_layout.addWidget(card, r, c)
-        return made_card
+        return False
 
     def _build_next_card_batch(self) -> None:
-        """Timer callback — finish the pending layout plan a slice at a time."""
-        self._flush_plan(_CARDS_PER_TICK)
-        if self._plan_index >= len(self._plan):
+        if self._materializing_all or not self._row_items:
             self._card_build_timer.stop()
-            self._update_selection_badge()
+            return
+        self._row_selected = {sp.id for sp in self._selected_plants}
+        missing = [r for r in sorted(self._active_rows)
+                   if r not in self._row_cards]
+        if not missing:
+            self._card_build_timer.stop()
+            return
+        if self._materialise_row(missing[0]):
+            self._recompute_row_tops()
+        if any(r not in self._row_cards for r in self._active_rows):
+            self._card_build_timer.start()
+        else:
+            self._card_build_timer.stop()
 
     def _finish_pending_build(self) -> None:
-        """Apply every remaining queued op now.
-
-        Used by the PNG/PDF exporters, which must capture a complete grid
-        rather than whatever the incremental builder has reached so far.
-        """
-        if self._plan_index < len(self._plan):
-            self._card_build_timer.stop()
-            self._flush_plan(len(self._plan))
-            self._update_selection_badge()
-
-        self._update_selection_badge()
+        """Materialise all rows for callers that need a complete widget tree."""
+        self._materialize_all_rows()
 
     def _on_card_selected(self, plant, ctrl_held: bool = False) -> None:
         """Track which cards are selected; Ctrl+click adds/removes from selection."""
@@ -1789,10 +1983,13 @@ class PlantGridView(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # F38: only re-flow when the column count actually changes
+        # F38: only re-flow when the column count actually changes, but a
+        # height-only resize still changes which virtualised rows are visible.
         avail_w = max(self._scroll.viewport().width() - PAD, COL_W)
         if max(1, avail_w // (CARD_W + PAD)) != getattr(self, "_last_cols", None):
             self._filter_timer.start(50)
+        elif self._row_items:
+            QTimer.singleShot(0, lambda: self._update_visible_rows(force=True))
 
     def eventFilter(self, obj, event) -> bool:
         """Intercept Delete/Backspace from child cards so we can batch-delete,

@@ -15,16 +15,18 @@ data directory) with one row per plant and one row per image.  Writes touch
 only the changed plant.  Reads still use the same in-memory caches so the hot
 paths (`get_all`, `has_image`, card rendering) stay allocation-light:
 
-_meta_cache : plant dicts WITHOUT 'images', but WITH 'thumb' (small JPEG) —
-              always in RAM.  Loaded from SQLite once, then kept in sync.
+_meta_cache : plant dicts WITHOUT 'images' or 'thumb' — always in RAM.
+              Loaded from SQLite once, then kept in sync.  Thumbnails live in
+              a dedicated SQLite table and are read lazily per visible card.
 _has_image_set : set of plant IDs with images — always in RAM.
 _img_store  : full-resolution base64 image strings — LAZILY loaded per plant,
               EVICTED after use.  Opening the edit dialog for one plant reads
               only that plant's image rows instead of parsing a giant file.
 
 RAM profile
-  startup        : ~1-5 MB  (metadata + thumbnails only, zero full-res strings)
-  first grid show: ~0 MB extra — thumbnails were already in _meta_cache
+  startup        : metadata only — thumbnails are no longer parsed or held
+  first grid show: only visible cards' thumbnails are read, then decoded into
+                   QPixmapCache and released; full-res strings are never loaded
   edit dialog     : ~400 KB spike per plant (images reloaded for that plant)
 
 Migration
@@ -38,6 +40,7 @@ data between machines or to keep a JSON snapshot.
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import logging
 import os
@@ -85,9 +88,12 @@ _db_path: str = ""
 _meta_cache:    Optional[Dict[str, dict]] = None   # metadata, no images
 _has_image_set: Set[str]                 = set()   # IDs with images on disk
 _img_store:     Dict[str, List[str]]     = {}      # lazily loaded, evict after decode
+_images_loaded: Set[str]                 = set()   # image lists read into a node
+_thumb_pending: Dict[str, Optional[str]] = {}      # thumbnails awaiting write
 
 _dirty_meta:    Set[str] = set()
 _dirty_images:  Set[str] = set()
+_dirty_thumbs:  Set[str] = set()
 _meta_flush_timer: Optional[threading.Timer] = None
 
 # Monotonically increasing counter bumped on every metadata mutation.  Views
@@ -128,6 +134,11 @@ CREATE TABLE IF NOT EXISTS images (
     PRIMARY KEY (plant_id, idx)
 );
 CREATE INDEX IF NOT EXISTS idx_images_plant ON images(plant_id);
+
+CREATE TABLE IF NOT EXISTS thumbs (
+    plant_id TEXT PRIMARY KEY,
+    data     BLOB NOT NULL
+);
 """
 
 
@@ -145,6 +156,22 @@ def _search_text(meta: dict) -> str:
 
 def _meta_json(meta: dict) -> str:
     return json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+
+
+def _thumb_blob(thumb: str) -> bytes:
+    """Store thumbnails as raw JPEG bytes instead of base64 in SQLite."""
+    try:
+        return base64.b64decode(thumb)
+    except Exception:
+        return str(thumb).encode("utf-8", "replace")
+
+
+def _thumb_text(data) -> Optional[str]:
+    if data is None:
+        return None
+    if isinstance(data, bytes):
+        return base64.b64encode(data).decode("ascii")
+    return str(data)
 
 
 def _ensure_conn() -> sqlite3.Connection:
@@ -227,8 +254,9 @@ def _migrate_from_json_if_needed(conn: sqlite3.Connection) -> bool:
                 if not isinstance(d, dict):
                     continue
                 meta = {k: v for k, v in d.items()
-                        if k not in ("images", "image_data")}
+                        if k not in ("images", "image_data", "thumb")}
                 meta["id"] = pid
+                thumb = d.get("thumb")
                 # Prefer the split images file when it has this plant.
                 if pid in img_data:
                     imgs = img_data.get(pid) or []
@@ -248,6 +276,10 @@ def _migrate_from_json_if_needed(conn: sqlite3.Connection) -> bool:
                         "INSERT OR REPLACE INTO images(plant_id,idx,data)"
                         " VALUES (?,?,?)",
                         [(pid, i, str(b)) for i, b in enumerate(imgs)])
+                if thumb:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO thumbs(plant_id,data)"
+                        " VALUES (?,?)", (pid, _thumb_blob(thumb)))
                 imported += 1
 
             # Images whose metadata row is absent are still preserved so
@@ -288,13 +320,26 @@ def _load_raw() -> Dict[str, dict]:
 
         meta_cache: Dict[str, dict] = {}
         has_images: Set[str] = set()
+        migrated_thumbs = 0
         try:
+            existing_thumbs = {pid for (pid,) in conn.execute(
+                "SELECT plant_id FROM thumbs")}
             for pid, meta_json in conn.execute("SELECT id, meta_json FROM plants"):
                 try:
                     d = json.loads(meta_json)
                     d["id"] = pid
                     d.pop("images", None)
                     d.pop("image_data", None)
+                    thumb = d.pop("thumb", None)
+                    if thumb is not None:
+                        # v1.24 stored thumbnails inline in meta_json.  Move
+                        # them to the dedicated table so get_all() no longer
+                        # copies every base64 thumbnail into RAM.
+                        if thumb and pid not in existing_thumbs:
+                            _thumb_pending[pid] = thumb
+                            _dirty_thumbs.add(pid)
+                            migrated_thumbs += 1
+                        _dirty_meta.add(pid)
                     meta_cache[pid] = d
                 except Exception as e:
                     log.warning("plant_db: skipping bad row %s: %s", pid, e)
@@ -305,8 +350,14 @@ def _load_raw() -> Dict[str, dict]:
 
         _meta_cache = meta_cache
         _has_image_set = has_images
+        if _dirty_meta or _dirty_thumbs:
+            _flush_meta_locked()
+            _flush_thumbs_locked()
         log.info("plant_db: loaded %d plant(s) (%d with images) from SQLite",
                  len(meta_cache), len(has_images))
+        if migrated_thumbs:
+            log.info("plant_db: migrated %d inline thumbnail(s) to thumbs table",
+                     migrated_thumbs)
         return _meta_cache
 
 
@@ -338,6 +389,7 @@ def _reload_plant_images(plant_id: str) -> List[str]:
             imgs = [r[0] for r in rows]
             if imgs:
                 _img_store[plant_id] = imgs
+            _images_loaded.add(plant_id)
             return imgs
         except Exception as e:
             log.error("plant_db: _reload_plant_images failed for %s: %s",
@@ -346,6 +398,30 @@ def _reload_plant_images(plant_id: str) -> List[str]:
 
 
 # ── Saving (dirty-row flushing) ───────────────────────────────────────────────
+
+def _flush_thumbs_locked() -> None:
+    """Write pending thumbnails in one transaction.  Caller must hold _lock."""
+    global _dirty_thumbs
+    if _conn is None or not _dirty_thumbs:
+        return
+    dirty = _dirty_thumbs
+    _dirty_thumbs = set()
+    pending = {pid: _thumb_pending.get(pid) for pid in dirty}
+    try:
+        with _conn:
+            for pid, thumb in pending.items():
+                if thumb:
+                    _conn.execute(
+                        "INSERT OR REPLACE INTO thumbs(plant_id,data) VALUES (?,?)",
+                        (pid, _thumb_blob(thumb)))
+                else:
+                    _conn.execute("DELETE FROM thumbs WHERE plant_id=?", (pid,))
+                _thumb_pending.pop(pid, None)
+    except Exception as e:
+        log.error("plant_db: thumbnail save error: %s", e)
+        _thumb_pending.update(pending)
+        _dirty_thumbs.update(dirty)
+
 
 def _flush_meta_locked() -> None:
     """Write only dirty metadata rows.  Caller must hold _lock."""
@@ -402,6 +478,11 @@ def _flush_meta() -> None:
         _flush_meta_locked()
 
 
+def _flush_thumbs() -> None:
+    with _lock:
+        _flush_thumbs_locked()
+
+
 def _flush_images() -> None:
     with _lock:
         _flush_images_locked()
@@ -435,7 +516,8 @@ def _flush_meta_safe() -> None:
     global _meta_flush_timer
     with _lock:
         _meta_flush_timer = None
-    _flush_meta()
+        _flush_meta_locked()
+        _flush_thumbs_locked()
 
 
 def _shutdown() -> None:
@@ -444,6 +526,7 @@ def _shutdown() -> None:
     with _lock:
         _cancel_meta_flush_locked()
         _flush_meta_locked()
+        _flush_thumbs_locked()
         _flush_images_locked()
         if _conn is not None:
             try:
@@ -462,11 +545,12 @@ def reset_cache() -> None:
     Call when the data directory changes.  Pending writes to the *old*
     database are flushed first.
     """
-    global _meta_cache, _has_image_set, _img_store
-    global _dirty_meta, _dirty_images, _conn, _db_path
+    global _meta_cache, _has_image_set, _img_store, _images_loaded, _thumb_pending
+    global _dirty_meta, _dirty_images, _dirty_thumbs, _conn, _db_path
     with _lock:
         _cancel_meta_flush_locked()
         _flush_meta_locked()
+        _flush_thumbs_locked()
         _flush_images_locked()
         if _conn is not None:
             try:
@@ -478,8 +562,11 @@ def reset_cache() -> None:
         _meta_cache = None
         _has_image_set = set()
         _img_store = {}
+        _images_loaded = set()
+        _thumb_pending = {}
         _dirty_meta = set()
         _dirty_images = set()
+        _dirty_thumbs = set()
     log.debug("plant_db: cache invalidated")
 
 
@@ -507,8 +594,10 @@ def get_images(plant_id: str) -> List[str]:
     with _lock:
         _load_raw()
         if plant_id in _img_store:
+            _images_loaded.add(plant_id)
             return list(_img_store[plant_id])
         if plant_id not in _has_image_set:
+            _images_loaded.add(plant_id)
             return []
         return _reload_plant_images(plant_id)
 
@@ -523,6 +612,7 @@ def evict_images(plant_id: str) -> None:
     """
     with _lock:
         _img_store.pop(plant_id, None)
+        _images_loaded.discard(plant_id)
 
 
 def populate_images(node: PlantNode) -> None:
@@ -530,20 +620,41 @@ def populate_images(node: PlantNode) -> None:
     node.images = list(get_images(node.id))
 
 
-def set_thumb(plant_id: str, thumb: Optional[str]) -> None:
-    """Persist a (re)generated thumbnail without touching full-res images.
+def get_thumb(plant_id: str) -> Optional[str]:
+    """Return a plant's base64 thumbnail without loading full-resolution images.
 
-    Used when a legacy plant (saved before thumbnails existed) gets its
-    thumbnail generated on first display — this is a metadata-only row update,
-    much cheaper than the old whole-file rewrite.  Writes are coalesced.
+    Thumbnails no longer live in the metadata cache, so opening a large
+    collection does not copy every base64 JPEG into RAM.  Cards call this only
+    when they actually become visible; the result is immediately decoded into
+    QPixmapCache and never retained by the model.
     """
     _load_raw()
     with _lock:
-        meta = (_meta_cache or {}).get(plant_id)
-        if meta is None:
+        if plant_id in _thumb_pending:
+            return _thumb_pending[plant_id]
+        try:
+            conn = _ensure_conn()
+            row = conn.execute(
+                "SELECT data FROM thumbs WHERE plant_id=?", (plant_id,)).fetchone()
+            return _thumb_text(row[0]) if row else None
+        except Exception as e:
+            log.error("plant_db: get_thumb failed for %s: %s", plant_id, e)
+            return None
+
+
+def set_thumb(plant_id: str, thumb: Optional[str]) -> None:
+    """Persist a (re)generated thumbnail without touching metadata or images.
+
+    Used when a legacy plant (saved before thumbnails existed) gets its
+    thumbnail generated on first display.  Writes are coalesced so scrolling a
+    large collection does not commit once per card.
+    """
+    _load_raw()
+    with _lock:
+        if plant_id not in (_meta_cache or {}):
             return
-        meta["thumb"] = thumb
-        _dirty_meta.add(plant_id)
+        _thumb_pending[plant_id] = thumb
+        _dirty_thumbs.add(plant_id)
         _schedule_meta_flush_locked()
 
 
@@ -622,12 +733,28 @@ def upsert(node: PlantNode) -> None:
         try:
             d = node.to_dict()
             imgs = d.pop("images", [])
+            thumb = d.pop("thumb", None)
             d.pop("image_data", None)
             d["id"] = node.id
             _meta_cache[node.id] = d          # type: ignore[index]
             _dirty_meta.add(node.id)
 
             prev_imgs = _img_store.get(node.id)
+            images_were_loaded = node.id in _images_loaded
+            images_cleared = not imgs and images_were_loaded
+            if imgs or images_were_loaded:
+                d["photo_count"] = len(imgs)
+            if thumb:
+                _thumb_pending[node.id] = thumb
+                _dirty_thumbs.add(node.id)
+            elif images_cleared:
+                # An edit that actually loaded and removed every image is
+                # authoritative; drop the now-orphaned thumbnail.  A plain
+                # autosave of a metadata-only node has thumb=None because the
+                # lazy cache never loaded it, and must leave the row alone.
+                _thumb_pending[node.id] = None
+                _dirty_thumbs.add(node.id)
+
             if imgs:
                 _img_store[node.id] = list(imgs)
                 _has_image_set.add(node.id)
@@ -638,14 +765,16 @@ def upsert(node: PlantNode) -> None:
                 # image rows entirely when nothing actually changed.
                 if prev_imgs is None or imgs != prev_imgs:
                     _dirty_images.add(node.id)
-            elif prev_imgs is not None:
+            elif images_were_loaded:
                 _img_store.pop(node.id, None)
+                _images_loaded.discard(node.id)
                 _has_image_set.discard(node.id)
                 _dirty_images.add(node.id)
             # else: images were never loaded — leave existing rows alone.
 
             _flush_meta_locked()
             _flush_images_locked()
+            _flush_thumbs_locked()
         except Exception as e:
             log.error("plant_db: upsert error: %s", e)
 
@@ -656,12 +785,16 @@ def remove(node_id: str) -> None:
         try:
             (_meta_cache or {}).pop(node_id, None)
             _img_store.pop(node_id, None)
+            _images_loaded.discard(node_id)
             _hay.pop(node_id, None)
             _has_image_set.discard(node_id)
+            _thumb_pending[node_id] = None
             _dirty_meta.add(node_id)
             _dirty_images.add(node_id)
+            _dirty_thumbs.add(node_id)
             _flush_meta_locked()
             _flush_images_locked()
+            _flush_thumbs_locked()
         except Exception as e:
             log.error("plant_db: remove error: %s", e)
 
@@ -687,14 +820,19 @@ def remove_many(node_ids: Iterable[str]) -> int:
             for nid in ids:
                 (_meta_cache or {}).pop(nid, None)
                 _img_store.pop(nid, None)
+                _images_loaded.discard(nid)
                 _hay.pop(nid, None)
                 _has_image_set.discard(nid)
+                _thumb_pending.pop(nid, None)
                 _dirty_meta.discard(nid)
                 _dirty_images.discard(nid)
+                _dirty_thumbs.discard(nid)
             if _conn is not None:
                 with _conn:
                     _conn.executemany(
                         "DELETE FROM images WHERE plant_id=?", [(i,) for i in ids])
+                    _conn.executemany(
+                        "DELETE FROM thumbs WHERE plant_id=?", [(i,) for i in ids])
                     _conn.executemany(
                         "DELETE FROM plants WHERE id=?", [(i,) for i in ids])
         except Exception as e:
@@ -748,13 +886,15 @@ def import_from_dict(incoming: Dict[str, dict]) -> int:
                     if not isinstance(d, dict):
                         continue
                     meta = {k: v for k, v in d.items()
-                            if k not in ("images", "image_data")}
+                            if k not in ("images", "image_data", "thumb")}
                     meta["id"] = pid
-                    _meta_cache[pid] = meta           # type: ignore[index]
+                    thumb = d.get("thumb")
                     imgs = d.get("images") or (
                         [d["image_data"]] if d.get("image_data") else [])
                     if imgs:
+                        meta["photo_count"] = len(imgs)
                         _has_image_set.add(pid)
+                    _meta_cache[pid] = meta           # type: ignore[index]
                     conn.execute(
                         "INSERT OR REPLACE INTO plants"
                         "(id,meta_json,name,species,cultivar,search_text,has_image)"
@@ -768,6 +908,10 @@ def import_from_dict(incoming: Dict[str, dict]) -> int:
                             "INSERT OR REPLACE INTO images(plant_id,idx,data)"
                             " VALUES (?,?,?)",
                             [(pid, i, str(b)) for i, b in enumerate(imgs)])
+                    if thumb:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO thumbs(plant_id,data)"
+                            " VALUES (?,?)", (pid, _thumb_blob(thumb)))
                     added += 1
         except Exception as e:
             log.error("plant_db: import_from_dict error: %s", e)
@@ -788,13 +932,18 @@ def export_all_for_bundle() -> Dict[str, dict]:
     with _lock:
         _flush_meta_locked()
         _flush_images_locked()
+        _flush_thumbs_locked()
         img_map = _load_all_images_map_locked()
+        thumb_map = {pid: _thumb_text(data) for pid, data in
+                     _ensure_conn().execute("SELECT plant_id,data FROM thumbs")}
         out: Dict[str, dict] = {}
         for pid, meta in (_meta_cache or {}).items():
             d = dict(meta)
             d.pop("images", None)
             d.pop("image_data", None)
             d["images"] = img_map.get(pid, [])
+            if thumb_map.get(pid):
+                d["thumb"] = thumb_map[pid]
             out[pid] = d
         return out
 
@@ -836,12 +985,15 @@ def debug_ram_stats() -> dict:
             except Exception:
                 meta_bytes = 0
         img_bytes = sum(len(s) for imgs in _img_store.values() for s in imgs)
+        thumb_bytes = sum(len(t) for t in _thumb_pending.values() if t)
         return {
             "meta_plant_count":             len(meta),
             "meta_bytes_approx":            meta_bytes,
             "has_image_count":              len(_has_image_set),
             "images_resident_plant_count":  len(_img_store),
             "images_resident_bytes_approx": img_bytes,
+            "thumbs_pending_count":         len(_thumb_pending),
+            "thumbs_pending_bytes_approx":  thumb_bytes,
         }
 
 

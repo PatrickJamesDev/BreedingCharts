@@ -356,8 +356,8 @@ grid._search.clear()
 settle(300)
 grid_cards = list(grid._card_cache.values())
 check("grid cards all parented", all(c.parent() is not None for c in grid_cards))
-check("grid card count matches shown plants",
-      len(grid_cards) == len(grid._all_plants))
+check("grid live cards bounded by visible plants",
+      0 < len(grid_cards) <= len(grid._visible_plants))
 
 print(f"  ---> {'all checks passed' if not _failures else str(len(_failures)) + ' FAILED'}")
 

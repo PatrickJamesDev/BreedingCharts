@@ -205,14 +205,10 @@ def save_lineage(tree: LineageTree, filepath: str) -> bool:
     `thumb` (small, cheap) stays inline as before — that's what card
     rendering uses.
 
-    The sidecar merge itself reads the *entire* .plf.images file and
-    rewrites it, so it's skipped whenever there's nothing for it to do —
-    i.e. no node's images were loaded/edited this session and no node was
-    removed. Plain metadata edits (rename, drag, tag/category changes —
-    the overwhelming majority of autosaves) never touch images at all, so
-    this turns most debounced saves into just the small metadata-only
-    write below instead of also reading+rewriting a potentially large
-    images file every 1.5 s.
+    The sidecar is SQLite-backed and the merge touches only the nodes whose
+    images were loaded/edited this session (plus deleting rows for removed
+    nodes), so a metadata-only autosave — the overwhelming majority — never
+    reads or writes any full-resolution image data.
     """
     import lineage_images
     try:
@@ -226,7 +222,8 @@ def save_lineage(tree: LineageTree, filepath: str) -> bool:
             atomic_write_json(filepath, d)
 
         if tree._image_loaded_ids or tree._images_maybe_stale:
-            lineage_images.merge_and_save(tree, filepath)
+            if not lineage_images.merge_and_save(tree, filepath):
+                raise RuntimeError("lineage image sidecar merge failed")
             lineage_images.evict_saved_images(tree)
             tree._images_maybe_stale = False
 
@@ -282,8 +279,10 @@ def write_prepared_save(prepared: dict, filepath: str) -> bool:
         with path_lock(filepath):
             atomic_write_json(filepath, prepared["doc"])
         if prepared["need_image_merge"]:
-            lineage_images.merge_and_save_snapshot(
-                filepath, prepared["images_snapshot"], prepared["valid_ids"])
+            if not lineage_images.merge_and_save_snapshot(
+                    filepath, prepared["images_snapshot"],
+                    prepared["valid_ids"]):
+                raise RuntimeError("lineage image sidecar merge failed")
         d = prepared["doc"]
         meta = write_lineage_meta(filepath, d)
         try:
@@ -342,7 +341,10 @@ def _migrate_legacy_inline_images(tree: LineageTree, raw_dict: dict, filepath: s
 
     on_disk = lineage_images.load_all_images(filepath)
     on_disk.update(legacy)
-    lineage_images.save_all_images(filepath, on_disk)
+    if not lineage_images.save_all_images(filepath, on_disk):
+        log.error("_migrate_legacy_inline_images: image sidecar write failed "
+                  "for %s; leaving inline images in place", filepath)
+        return
 
     try:
         d = tree.to_dict()

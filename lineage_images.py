@@ -1,19 +1,18 @@
 """
 lineage_images.py — Lazy full-resolution image storage for lineage (.plf) files.
 
-Mirrors the plant_db.py lazy-image architecture (metadata/images split,
-evict-after-use, merge-on-save) but scoped to a single lineage file:
+Mirrors the plant_db.py lazy-image architecture (per-node reads, evict-after-use,
+merge-on-save) but scoped to a single lineage file:
 
-  <name>.plf          tree structure, node metadata, and small `thumb`
-                       fields (JPEG, capped at image_utils.THUMB_MAX_DIM).
-                       Always loaded eagerly by database.load_lineage() —
-                       this is what card rendering uses, and it's small.
+  <name>.plf                 tree structure and node metadata.  Always loaded
+                             eagerly by database.load_lineage().
 
-  <name>.plf.images    {node_id: [base64, ...]} full-resolution originals,
-                       byte-for-byte as uploaded. Loaded ONLY when a node's
-                       full images are actually needed — opening the Images
-                       tab, exporting, copy/paste, adding/replacing a photo
-                       — and never held for the whole session otherwise.
+  <name>.plf.images.sqlite3  full-resolution originals, one row per image.
+                             SQLite lets us read/write just the node(s) that
+                             were actually touched instead of parsing and
+                             rewriting one giant JSON sidecar.  Old
+                             <name>.plf.images JSON sidecars are migrated
+                             automatically on first access.
 
 Full-resolution data is still 100% present on disk; this module just keeps
 it from being resident in RAM (or decoded to pixels) except when something
@@ -34,45 +33,178 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
+import threading
 from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
+_LEGACY_SUFFIX = ".images"
+_SUFFIX        = ".images.sqlite3"
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS node_images (
+    node_id TEXT NOT NULL,
+    idx     INTEGER NOT NULL,
+    data    TEXT NOT NULL,
+    PRIMARY KEY (node_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_node_images_node ON node_images(node_id);
+"""
+
+_migrate_lock = threading.Lock()
+
 
 def images_filepath(plf_path: str) -> str:
-    return plf_path + ".images"
+    return plf_path + _SUFFIX
 
 
-def load_all_images(plf_path: Optional[str]) -> Dict[str, List[str]]:
-    """Read the whole sidecar file. Only call this when bulk access is
-    genuinely needed (migration, or the merge step inside save)."""
+def legacy_images_filepath(plf_path: str) -> str:
+    return plf_path + _LEGACY_SUFFIX
+
+
+def _connect(path: str) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    conn = sqlite3.connect(path, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.executescript(_SCHEMA)
+    return conn
+
+
+def _load_legacy(plf_path: Optional[str]) -> Dict[str, List[str]]:
     if not plf_path:
         return {}
-    p = images_filepath(plf_path)
+    p = legacy_images_filepath(plf_path)
     if not os.path.isfile(p):
         return {}
     try:
         with open(p, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            data = json.load(fh)
+        return {str(k): [str(b) for b in (v or [])]
+                for k, v in data.items() if isinstance(v, list) and v}
     except Exception as e:
-        log.error("lineage_images: failed to read %s: %s", p, e)
+        log.error("lineage_images: failed to read legacy %s: %s", p, e)
         return {}
 
 
+def _write_all(path: str, images_by_node: Dict[str, List[str]]) -> None:
+    conn = _connect(path)
+    try:
+        with conn:
+            conn.execute("DELETE FROM node_images")
+            rows = [(nid, i, str(b))
+                    for nid, imgs in images_by_node.items()
+                    for i, b in enumerate(imgs) if b]
+            if rows:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO node_images(node_id,idx,data)"
+                    " VALUES (?,?,?)", rows)
+    finally:
+        conn.close()
+
+
+def _migrate_legacy(plf_path: Optional[str]) -> None:
+    """Move an old JSON sidecar into SQLite exactly once.
+
+    The old file is renamed to .images.migrated rather than deleted, so a
+    failed upgrade can still be recovered manually.  The migration is a
+    no-op for new-format files and for freshly created lineages.
+    """
+    if not plf_path:
+        return
+    db_path = images_filepath(plf_path)
+    old_path = legacy_images_filepath(plf_path)
+    if os.path.isfile(db_path) or not os.path.isfile(old_path):
+        return
+    with _migrate_lock:
+        if os.path.isfile(db_path) or not os.path.isfile(old_path):
+            return
+        data = _load_legacy(plf_path)
+        try:
+            _write_all(db_path, data)
+        except Exception as e:
+            log.error("lineage_images: migration failed for %s: %s", old_path, e)
+            # The database did not exist before this attempt; remove any
+            # partial file so the next read retries from the untouched JSON.
+            for p in (db_path, db_path + "-wal", db_path + "-shm"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            return
+        try:
+            os.replace(old_path, old_path + ".migrated")
+        except OSError as e:
+            log.warning("lineage_images: could not archive %s: %s", old_path, e)
+        log.info("lineage_images: migrated %s → %s (%d node(s))",
+                 old_path, db_path, len(data))
+
+
+def load_all_images(plf_path: Optional[str]) -> Dict[str, List[str]]:
+    """Read every image row.  Only for explicit bulk access (export/bundle)."""
+    if not plf_path:
+        return {}
+    _migrate_legacy(plf_path)
+    db_path = images_filepath(plf_path)
+    if not os.path.isfile(db_path):
+        return _load_legacy(plf_path)
+    out: Dict[str, List[str]] = {}
+    try:
+        conn = _connect(db_path)
+        try:
+            for nid, data in conn.execute(
+                    "SELECT node_id,data FROM node_images ORDER BY node_id,idx"):
+                out.setdefault(nid, []).append(data)
+        finally:
+            conn.close()
+    except Exception as e:
+        log.error("lineage_images: failed to read %s: %s", db_path, e)
+        return _load_legacy(plf_path)
+    return out
+
+
 def get_node_images(plf_path: Optional[str], node_id: str) -> List[str]:
-    """Lazily read just one node's full-resolution images from disk. The
-    result isn't cached by this function — the caller decides whether to
-    hold onto it (see populate_node_images)."""
-    return list(load_all_images(plf_path).get(node_id, []))
+    """Read just one node's full-resolution images.  The result isn't cached
+    here — the caller decides whether to hold onto it."""
+    if not plf_path:
+        return []
+    _migrate_legacy(plf_path)
+    db_path = images_filepath(plf_path)
+    if not os.path.isfile(db_path):
+        return list(_load_legacy(plf_path).get(node_id, []))
+    try:
+        conn = _connect(db_path)
+        try:
+            return [row[0] for row in conn.execute(
+                "SELECT data FROM node_images WHERE node_id=? ORDER BY idx",
+                (node_id,))]
+        finally:
+            conn.close()
+    except Exception as e:
+        log.error("lineage_images: get_node_images failed for %s: %s",
+                  node_id, e)
+        return []
 
 
 def save_all_images(plf_path: str, images_by_node: Dict[str, List[str]]) -> bool:
+    """Replace the whole store.  Used for migration and explicit bulk writes."""
     p = images_filepath(plf_path)
+    cleaned: Dict[str, List[str]] = {}
+    for nid, imgs in (images_by_node or {}).items():
+        if not isinstance(imgs, (list, tuple)):
+            continue
+        vals = [str(b) for b in imgs if b]
+        if vals:
+            cleaned[str(nid)] = vals
     try:
-        cleaned = {nid: imgs for nid, imgs in images_by_node.items() if imgs}
-        os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-        from fileio import atomic_write_json
-        atomic_write_json(p, cleaned)
+        _write_all(p, cleaned)
+        old = legacy_images_filepath(plf_path)
+        if os.path.isfile(old):
+            try:
+                os.replace(old, old + ".migrated")
+            except OSError:
+                pass
         return True
     except Exception as e:
         log.error("lineage_images: failed to write %s: %s", p, e)
@@ -80,19 +212,28 @@ def save_all_images(plf_path: str, images_by_node: Dict[str, List[str]]) -> bool
 
 
 def delete_sidecar(plf_path: str) -> None:
-    p = images_filepath(plf_path)
-    try:
-        if os.path.isfile(p):
-            os.remove(p)
-    except OSError as e:
-        log.warning("lineage_images: could not remove %s: %s", p, e)
+    for p in (images_filepath(plf_path),
+              legacy_images_filepath(plf_path),
+              legacy_images_filepath(plf_path) + ".migrated"):
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError as e:
+            log.warning("lineage_images: could not remove %s: %s", p, e)
+    for suffix in ("-wal", "-shm"):
+        try:
+            p = images_filepath(plf_path) + suffix
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
 
 
 # ── Session-level helpers (operate on a LineageTree instance) ─────────────────
 
 def populate_node_images(tree, plf_path: Optional[str], node_id: str) -> List[str]:
     """Make node.images authoritative for this session: load from the
-    sidecar on first touch, then just return what's already there. Call
+    store on first touch, then just return what's already there. Call
     this before reading/editing a node's full images (edit dialog, copy,
     export, or mutating an existing node's photo)."""
     node = tree.nodes.get(node_id) if tree else None
@@ -127,19 +268,46 @@ def snapshot_for_merge(tree) -> Dict[str, List[str]]:
 
 def merge_and_save_snapshot(plf_path: str, touched: Dict[str, List[str]],
                              valid_node_ids) -> bool:
-    """File-I/O half of the sidecar merge — operates only on plain data
-    (never the live tree), so it's safe to run on a background thread."""
-    on_disk = load_all_images(plf_path)
-    on_disk.update(touched)
-    on_disk = {nid: imgs for nid, imgs in on_disk.items()
-               if nid in valid_node_ids and imgs}
-    return save_all_images(plf_path, on_disk)
+    """File-I/O half of the sidecar merge — operate only on the touched
+    nodes, so saving one edited photo no longer reads/writes every other
+    node's full-resolution image rows."""
+    try:
+        _migrate_legacy(plf_path)
+        db_path = images_filepath(plf_path)
+        conn = _connect(db_path)
+        valid = set(valid_node_ids)
+        try:
+            with conn:
+                stored = {row[0] for row in conn.execute(
+                    "SELECT DISTINCT node_id FROM node_images")}
+                stale = stored - valid
+                if stale:
+                    conn.executemany(
+                        "DELETE FROM node_images WHERE node_id=?",
+                        [(nid,) for nid in stale])
+                for nid, imgs in touched.items():
+                    if nid not in valid:
+                        continue
+                    conn.execute(
+                        "DELETE FROM node_images WHERE node_id=?", (nid,))
+                    rows = [(nid, i, str(b))
+                            for i, b in enumerate(imgs or []) if b]
+                    if rows:
+                        conn.executemany(
+                            "INSERT OR REPLACE INTO node_images"
+                            "(node_id,idx,data) VALUES (?,?,?)", rows)
+        finally:
+            conn.close()
+        return True
+    except Exception as e:
+        log.error("lineage_images: merge save failed for %s: %s", plf_path, e)
+        return False
 
 
 def merge_and_save(tree, plf_path: str) -> bool:
-    """Write the images sidecar: touched nodes' current .images win, every
-    other node's on-disk entry is left alone, and entries for nodes no
-    longer in the tree are dropped."""
+    """Write touched nodes' current .images; every other node's on-disk
+    rows are left alone, and entries for nodes no longer in the tree are
+    dropped."""
     return merge_and_save_snapshot(
         plf_path, snapshot_for_merge(tree), set(tree.nodes.keys()))
 

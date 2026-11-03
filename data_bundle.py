@@ -18,7 +18,7 @@ already on the local machine is ever overwritten or removed:
   • Lineages merge by LineageTree.id, not filename: an incoming lineage
     whose id already exists locally is skipped entirely (it's the same
     lineage, already here). Every other incoming lineage is written out
-    as a brand-new .plf file (+ its .plf.images sidecar, if it has one),
+    as a brand-new .plf file (+ its image sidecar, if it has one),
     using a filename guaranteed not to collide with anything already in
     the data folder — so a friend's "My Lineage" and your own "My
     Lineage" both end up present side by side rather than one clobbering
@@ -62,9 +62,15 @@ def export_bundle(filepath: str, lineage_paths: List[str],
                     continue
                 base = os.path.basename(plf_path)
                 zf.write(plf_path, arcname=f"lineages/{base}")
-                sidecar = plf_path + ".images"
-                if os.path.isfile(sidecar):
-                    zf.write(sidecar, arcname=f"lineages/{base}.images")
+                # Bundles keep the portable JSON image format so older
+                # BreedingCharts builds (and this one) can import them.  The
+                # local store itself is SQLite; only this explicit export
+                # loads every image.
+                import lineage_images
+                sidecar_imgs = lineage_images.load_all_images(plf_path)
+                if sidecar_imgs:
+                    zf.writestr(f"lineages/{base}.images",
+                                json.dumps(sidecar_imgs, ensure_ascii=False))
                 manifest["lineages"].append(base)
 
             if include_plant_db:
@@ -175,13 +181,24 @@ def import_bundle(filepath: str) -> BundleImportResult:
                 dest_path = _db.default_filepath(
                     tree_dict.get("name", "Imported Lineage"), directory=data_dir)
                 dest_path = _unique_path(dest_path)
-                from fileio import atomic_write_json, atomic_write_bytes
+                from fileio import atomic_write_json
                 atomic_write_json(dest_path, tree_dict)
                 _db.write_lineage_meta(dest_path, tree_dict)
 
                 sidecar_arc = arc + ".images"
                 if sidecar_arc in names:
-                    atomic_write_bytes(dest_path + ".images", zf.read(sidecar_arc))
+                    try:
+                        incoming_imgs = json.loads(
+                            zf.read(sidecar_arc).decode("utf-8"))
+                        if isinstance(incoming_imgs, dict):
+                            import lineage_images
+                            if not lineage_images.save_all_images(
+                                    dest_path, incoming_imgs):
+                                log.warning("data_bundle: image sidecar write "
+                                            "failed for %s", lf_name)
+                    except Exception as e:
+                        log.warning("data_bundle: could not import images for "
+                                    "%s: %s", lf_name, e)
 
                 if tree_id:
                     existing_ids.add(tree_id)
