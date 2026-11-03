@@ -24,5 +24,5 @@ and never touch your real data. Timings are machine dependent; compare ratios, n
 | verify_g1 | scaled JPEG thumbnail decode and photo format choice (F22/F51) |
 | verify_perf2 | `.plf.meta` sidecar/stale fallback (F30), incremental connect/disconnect/remove edges vs full rebuild (F42), per-child role edge colours (F12) |
 | verify_undo | lightweight drag snapshot, in-place undo of drag/edit/add/delete, card and pixmap retention (F43/F64) |
-| verify_f24_f31 | thumbnails outside meta_json with lazy reads/migration, SQLite per-node lineage image store, bundle round-trip (F24/F31) |
-| verify_f33 | virtualised grid keeps a bounded live-card count, scrolls, selects, filters and exports fully (F33) |
+| verify_f24_f31 | thumbnails outside meta_json with lazy/batch reads and migration, SQLite per-node lineage image store with reusable read connections, sidecar-first saves and failure safety, bundle round-trip (F24/F31) |
+| verify_f33 | virtualised grid keeps a bounded live-card count, recycles cards into a bounded spare pool, scrolls, selects, filters and exports fully with off-screen photos decoded (F33) |

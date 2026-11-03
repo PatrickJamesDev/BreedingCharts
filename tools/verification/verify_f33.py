@@ -26,6 +26,34 @@ sb.setValue(sb.maximum()); app.processEvents(); settle(30)
 assert 0 < len(g._card_cache) < 150
 print(f"F33 virtual grid: {built} live cards for {N} plants; scroll extent {sb.maximum()} px")
 
+# Off-screen cards must go back into the bounded spare pool and be reused by
+# the next row instead of constructing new widgets on every scroll.
+sb.setValue(sb.maximum() // 2)
+spare_before = {id(c) for c in g._spare_cards}
+assert spare_before
+row = next(r for r in sorted(g._row_items) if r not in g._row_cards)
+g._materialise_row(row)
+assert row in g._row_cards
+reused = [c for c in g._row_cards[row] if id(c) in spare_before]
+assert reused and len(reused) == len(g._row_cards[row])
+row_pids = {c.plant.id for cards in g._row_cards.values() for c in cards}
+assert set(g._card_cache) == row_pids
+assert len(g._spare_cards) <= 120
+g._dematerialise_row(row); app.processEvents()
+assert set(g._card_cache) == {c.plant.id for cards in g._row_cards.values() for c in cards}
+
+# Re-binding a recycled card to an updated PlantNode (same id) must refresh
+# its labels, not just keep the old name/species from the previous object.
+old = g._row_items[row][0][1]
+updated = PlantNode.from_dict(old.to_dict()); updated.name = "Recycled Rename"
+g._row_items[row] = [(c, updated if p.id == old.id else p)
+                     for c, p in g._row_items[row]]
+g._materialise_row(row)
+card = next(c for c in g._row_cards[row] if c.plant.id == old.id)
+assert card._name_lbl.text() == "Recycled Rename"
+g._dematerialise_row(row); app.processEvents()
+print("F33 off-screen cards recycled into the bounded spare pool")
+
 g._select_all(); app.processEvents()
 assert len(g._selected_plants) == N
 sb.setValue(sb.maximum() // 2); app.processEvents(); settle(30)

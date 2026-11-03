@@ -557,6 +557,7 @@ class SectionHeaderWidget(QWidget):
 
 _CARDS_FIRST_PAINT = 40
 _CARDS_PER_TICK = 40
+_SPARE_CARD_LIMIT = 120
 
 
 class _CardTextArea(QWidget):
@@ -645,8 +646,7 @@ class MiniPlantCard(QFrame):
         tl.setContentsMargins(8, 6, 8, 6)
         tl.setSpacing(2)
 
-        name_text, name_capped = _capped_card_text(self.plant.name or "Unnamed")
-        name_lbl = QLabel(name_text)
+        name_lbl = QLabel()
         name_lbl.setWordWrap(True)
         name_lbl.setFont(QFont(self._card_font, self._card_font_size, QFont.Weight.Bold))
         name_lbl.setStyleSheet(f"color: {self._pal.get('node_name','#e8f5e8')}; background: transparent;")
@@ -657,61 +657,44 @@ class MiniPlantCard(QFrame):
         # still yields the same card height as before via the addStretch()
         # below; a long one simply makes its own card a bit taller.
         name_lbl.setMaximumWidth(CARD_W - 16)    # 16 = left+right margin (8+8)
-        name_lbl.setToolTip((self.plant.name or "") if name_capped else "")
         name_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         tl.addWidget(name_lbl)
+        self._name_lbl = name_lbl
 
-        if self.plant.species:
-            sp_text, sp_capped = _capped_card_text(self.plant.species)
-            sp_f = QFont(self._card_font, max(6, self._card_font_size - 1)); sp_f.setItalic(True)
-            # Same treatment as the name: wrap in full rather than elide to
-            # one line, so nothing is hidden behind a "…" the user has to
-            # hover to reveal.
-            sp_lbl = QLabel(sp_text)
-            sp_lbl.setWordWrap(True)
-            sp_lbl.setFont(sp_f)
-            sp_lbl.setMaximumWidth(CARD_W - 16)
-            sp_lbl.setStyleSheet(f"color: {self._pal.get('text_muted','#90b898')}; background: transparent;")
-            if sp_capped:
-                sp_lbl.setToolTip(self.plant.species)
-            sp_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            tl.addWidget(sp_lbl)
+        sp_f = QFont(self._card_font, max(6, self._card_font_size - 1)); sp_f.setItalic(True)
+        sp_lbl = QLabel()
+        sp_lbl.setWordWrap(True)
+        sp_lbl.setFont(sp_f)
+        sp_lbl.setMaximumWidth(CARD_W - 16)
+        sp_lbl.setStyleSheet(f"color: {self._pal.get('text_muted','#90b898')}; background: transparent;")
+        sp_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        tl.addWidget(sp_lbl)
+        self._sp_lbl = sp_lbl
 
-        role_label = self._get_role_label()
-        if role_label:
-            role_col = "#e87060" if "Mother" in role_label else "#60a0e8"
-            role_lbl = QLabel(role_label)
-            role_lbl.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-            role_lbl.setStyleSheet(f"color: {role_col}; background: transparent;")
-            role_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            tl.addWidget(role_lbl)
+        role_lbl = QLabel()
+        role_lbl.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        role_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        tl.addWidget(role_lbl)
+        self._role_lbl = role_lbl
 
-        if self.plant.year:
-            yr_lbl = QLabel(str(self.plant.year))
-            yr_lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            yr_lbl.setStyleSheet(
-                f"color: {self._pal.get('year_fg','#f0b84a')}; "
-                f"background: {self._pal.get('year_bg','#3d2e00')}; "
-                f"border-radius: 6px; padding: 1px 6px;")
-            yr_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            tl.addWidget(yr_lbl)
+        yr_lbl = QLabel()
+        yr_lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        yr_lbl.setStyleSheet(
+            f"color: {self._pal.get('year_fg','#f0b84a')}; "
+            f"background: {self._pal.get('year_bg','#3d2e00')}; "
+            f"border-radius: 6px; padding: 1px 6px;")
+        yr_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        tl.addWidget(yr_lbl)
+        self._year_lbl = yr_lbl
 
-        if self.plant.tags:
-            tags = self.plant.tags
-            shown = tags[:_CARD_TAG_DISPLAY_CAP]
-            tag_str = "  ".join(f"[{t}]" for t in shown)
-            overflow = len(tags) - len(shown)
-            if overflow > 0:
-                tag_str += f"  +{overflow} more"
-            tag_lbl = QLabel(tag_str)
-            tag_lbl.setFont(QFont("Segoe UI", 7))
-            tag_lbl.setStyleSheet(f"color: {self._pal.get('tag_fg','#70d888')}; background: transparent;")
-            tag_lbl.setWordWrap(True)
-            tag_lbl.setMaximumWidth(CARD_W - 16)
-            if overflow > 0:
-                tag_lbl.setToolTip("  ".join(f"[{t}]" for t in tags))
-            tag_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-            tl.addWidget(tag_lbl)
+        tag_lbl = QLabel()
+        tag_lbl.setFont(QFont("Segoe UI", 7))
+        tag_lbl.setStyleSheet(f"color: {self._pal.get('tag_fg','#70d888')}; background: transparent;")
+        tag_lbl.setWordWrap(True)
+        tag_lbl.setMaximumWidth(CARD_W - 16)
+        tag_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        tl.addWidget(tag_lbl)
+        self._tag_lbl = tag_lbl
 
         tl.addStretch()
 
@@ -725,7 +708,7 @@ class MiniPlantCard(QFrame):
             f"color: {self._pal.get('accent','#4ecb6a')}; border: none; border-radius: 4px; font-size: 10px; }}"
             f"QPushButton:hover {{ background: {self._pal.get('btn_hover','#284038')}; }}"
         )
-        edit_btn.clicked.connect(lambda: self.edit_requested.emit(self.plant))
+        edit_btn.clicked.connect(self._emit_edit)
 
         del_btn = QPushButton("🗑️")
         del_btn.setFixedSize(28, 22)
@@ -735,7 +718,7 @@ class MiniPlantCard(QFrame):
             f"color: #e87060; border: none; border-radius: 4px; font-size: 10px; }}"
             f"QPushButton:hover {{ background: #3a1010; }}"
         )
-        del_btn.clicked.connect(lambda: self.delete_requested.emit(self.plant))
+        del_btn.clicked.connect(self._emit_delete)
 
         # Buttons stay fully interactive — only the labels/containers around
         # them are made click-transparent above, so pointer events on the
@@ -746,11 +729,94 @@ class MiniPlantCard(QFrame):
         tl.addLayout(btn_row)
 
         lay.addWidget(text_w)
+        self._prefetched_thumb: Optional[str] = None
+        self._apply_plant_data()
 
     def _get_role_label(self) -> str:
         if self._role == "mother": return "♀ Mother"
         if self._role == "father": return "♂ Father"
         return ""
+
+    def _apply_plant_data(self) -> None:
+        """Refresh every text label for the currently bound plant."""
+        plant = self.plant
+        name_text, name_capped = _capped_card_text(plant.name or "Unnamed")
+        self._name_lbl.setText(name_text)
+        self._name_lbl.setToolTip((plant.name or "") if name_capped else "")
+
+        if plant.species:
+            sp_text, sp_capped = _capped_card_text(plant.species)
+            self._sp_lbl.setText(sp_text)
+            self._sp_lbl.setToolTip(plant.species if sp_capped else "")
+            self._sp_lbl.show()
+        else:
+            self._sp_lbl.hide()
+
+        role_label = self._get_role_label()
+        if role_label:
+            role_col = "#e87060" if "Mother" in role_label else "#60a0e8"
+            self._role_lbl.setText(role_label)
+            self._role_lbl.setStyleSheet(
+                f"color: {role_col}; background: transparent;")
+            self._role_lbl.show()
+        else:
+            self._role_lbl.hide()
+
+        if plant.year:
+            self._year_lbl.setText(str(plant.year))
+            self._year_lbl.show()
+        else:
+            self._year_lbl.hide()
+
+        if plant.tags:
+            tags = plant.tags
+            shown = tags[:_CARD_TAG_DISPLAY_CAP]
+            tag_str = "  ".join(f"[{t}]" for t in shown)
+            overflow = len(tags) - len(shown)
+            if overflow > 0:
+                tag_str += f"  +{overflow} more"
+                self._tag_lbl.setToolTip(
+                    "  ".join(f"[{t}]" for t in tags))
+            else:
+                self._tag_lbl.setToolTip("")
+            self._tag_lbl.setText(tag_str)
+            self._tag_lbl.show()
+        else:
+            self._tag_lbl.hide()
+
+        self.setToolTip(
+            f"{plant.name}\n{plant.species or ''}\n{plant.year or ''}")
+
+    def set_plant(self, plant, role: str = "",
+                  prefetched_thumb: Optional[str] = None) -> None:
+        """Re-bind this card to another plant without rebuilding its widgets.
+
+        The grid recycles off-screen cards; only labels, the placeholder and
+        the cached thumbnail reference change.  Signal connections and child
+        widgets are reused, which removes the per-card construction cost from
+        scrolling.
+        """
+        image_changed = (
+            getattr(self.plant, "id", None) != plant.id
+            or getattr(self.plant, "thumb", None) != plant.thumb)
+        self.plant = plant
+        self._role = role
+        self._prefetched_thumb = prefetched_thumb
+        if image_changed:
+            self._image_loaded = False
+            self._img_lbl.clear()
+            self._show_placeholder()
+            self._image_loaded = False
+        self._apply_plant_data()
+
+    def _emit_edit(self) -> None:
+        self.edit_requested.emit(self.plant)
+
+    def _emit_delete(self) -> None:
+        self.delete_requested.emit(self.plant)
+
+    def _emit_add_to_lineage(self) -> None:
+        self.add_to_lineage_requested.emit(self.plant)
 
     def _load_image(self) -> None:
         import plant_db as _pdb
@@ -765,7 +831,8 @@ class MiniPlantCard(QFrame):
             self._image_loaded = True
             return
 
-        b64 = self.plant.thumb or _pdb.get_thumb(self.plant.id)
+        b64 = (self.plant.thumb or self._prefetched_thumb
+               or _pdb.get_thumb(self.plant.id))
         using_full_res = False
         if not b64:
             # Legacy plant saved before thumbnails existed — fall back to
@@ -936,6 +1003,7 @@ class PlantGridView(QWidget):
         # labels, buttons and stylesheets.  _card_cache therefore contains
         # only the currently materialised cards.
         self._card_cache: Dict[str, MiniPlantCard] = {}
+        self._spare_cards: list[MiniPlantCard] = []
         self._row_items: Dict[int, list] = {}
         self._row_headers: Dict[int, str] = {}
         self._row_heights: Dict[int, int] = {}
@@ -949,6 +1017,7 @@ class PlantGridView(QWidget):
         self._n_cols: int = 1
         self._content_height: int = 0
         self._materializing_all: bool = False
+        self._exporting: bool = False
         self._updating_window: bool = False
         # Kept for compatibility with the old incremental builder/tests; the
         # virtualised path never starts it.
@@ -992,6 +1061,7 @@ class PlantGridView(QWidget):
             self._card_font_size = font_size
             changed = True
         if changed:
+            self._dispose_spare_cards()
             self._card_cache.clear()   # stale widgets (wrong colours / font)
             self._selected_plants = []
             self._dirty = True
@@ -1004,6 +1074,7 @@ class PlantGridView(QWidget):
         if self._card_font == font_family:
             return
         self._card_font = font_family
+        self._dispose_spare_cards()
         self._card_cache.clear()
         self._selected_plants = []
         self._dirty = True
@@ -1014,6 +1085,7 @@ class PlantGridView(QWidget):
         if self._card_font_size == size:
             return
         self._card_font_size = size
+        self._dispose_spare_cards()
         self._card_cache.clear()
         self._selected_plants = []
         self._dirty = True
@@ -1023,6 +1095,7 @@ class PlantGridView(QWidget):
     def update_palette(self, palette: dict) -> None:
         self._pal = palette
         # Invalidate entire cache since colours changed
+        self._dispose_spare_cards()
         self._card_cache.clear()
         self._selected_plants = []
         self._dirty = True
@@ -1042,6 +1115,7 @@ class PlantGridView(QWidget):
             "all_plants_loaded":   len(self._all_plants),
             "visible_plant_count": len(getattr(self, "_visible_plants", [])),
             "materialised_rows":   len(self._active_rows),
+            "spare_card_widgets":  len(self._spare_cards),
         }
 
     def set_lineage_open(self, name: Optional[str]) -> None:
@@ -1346,6 +1420,8 @@ class PlantGridView(QWidget):
         # grid, not just the virtualised viewport.  Restore the window after
         # grabbing so the memory spike is short-lived.
         self._card_build_timer.stop()
+        self._filter_timer.stop()
+        self._exporting = True
         self._materialize_all_rows()
         try:
             # Cards created for off-screen rows have not been through the
@@ -1360,7 +1436,10 @@ class PlantGridView(QWidget):
             QApplication.processEvents()
             return self._grid_widget.grab()
         finally:
-            self._restore_viewport_window()
+            try:
+                self._restore_viewport_window()
+            finally:
+                self._exporting = False
 
     def _export_grid_png(self) -> None:
         """Export the ENTIRE plant grid / spreadsheet (all rows, not just
@@ -1534,6 +1613,8 @@ class PlantGridView(QWidget):
 
     def _rebuild_current_view(self) -> None:
         """Dispatch to the active view's rebuild method."""
+        if self._exporting:
+            return
         # Flush any stale queued decodes from the previous layout before rebuilding.
         self._img_decode_queue.clear()
         self._img_decode_timer.stop()
@@ -1636,12 +1717,12 @@ class PlantGridView(QWidget):
 
         role_map = self._build_role_map()
         selected_ids = {sp.id for sp in self._selected_plants}
-        current_ids = {p.id for p in plants}
-        rev = plant_db.get_revision()
-        reuse = getattr(self, "_cards_rev", None) == rev
-
         scroll_y = self._scroll.verticalScrollBar().value()
-        self._clear_materialised_grid(current_ids if reuse else ())
+        # Recycle every old card; the rebuilt rows pull them back out of the
+        # spare pool and re-bind them to the new plant order.  Keeping cards
+        # by ID here used to leave off-screen cards cached but unmapped when
+        # the filter/sort changed.
+        self._clear_materialised_grid()
 
         if not plants:
             empty = QLabel("No plants found." if q else
@@ -1709,38 +1790,22 @@ class PlantGridView(QWidget):
         self._scroll.verticalScrollBar().setValue(scroll_y)
         self._window_rows: tuple = (-1, -1)
         self._update_visible_rows(force=True)
-        self._cards_rev = rev
         self._update_selection_badge()
 
-    def _clear_materialised_grid(self, keep_ids=()) -> None:
-        """Destroy old layout, optionally retaining cards for unchanged data.
-
-        Sort/filter rebuilds keep the same plant revisions, so the handful of
-        visible cards can be re-attached instead of rebuilt — the expensive
-        part (a dozen widgets, stylesheets and layouts per card) disappears.
-        """
+    def _clear_materialised_grid(self) -> None:
+        """Remove the current layout and recycle its cards for reuse."""
         self._img_decode_queue.clear()
         self._img_decode_timer.stop()
         self._card_build_timer.stop()
-        keep = set(keep_ids)
-        keep_cards = set()
-        for pid, card in list(self._card_cache.items()):
-            try:
-                self._grid_layout.removeWidget(card)
-            except Exception:
-                pass
-            if pid in keep:
-                keep_cards.add(card)
-            else:
-                self._card_cache.pop(pid, None)
-                card.hide()
-                card.deleteLater()
+        for card in list(self._card_cache.values()):
+            self._recycle_card(card)
         # apply_card_settings() can clear _card_cache before a rebuild, which
         # used to leave the old cards parented (and visible) outside the
-        # layout.  Sweep the layout for any card not explicitly kept.
+        # layout.  Sweep the layout for any orphaned card and destroy it, as
+        # those may carry stale theme/font styling.
         for i in range(self._grid_layout.count()):
             card = self._grid_layout.itemAt(i).widget()
-            if isinstance(card, MiniPlantCard) and card not in keep_cards:
+            if isinstance(card, MiniPlantCard):
                 card.hide()
                 card.deleteLater()
         for hw in getattr(self, "_section_headers", []):
@@ -1802,7 +1867,7 @@ class PlantGridView(QWidget):
         self._update_visible_rows()
 
     def _update_visible_rows(self, force: bool = False) -> None:
-        if self._materializing_all or not self._row_items:
+        if self._exporting or self._materializing_all or not self._row_items:
             return
         active = self._rows_in_viewport()
         if not force and active == self._active_rows:
@@ -1839,27 +1904,46 @@ class PlantGridView(QWidget):
             self._grid_layout.removeItem(ph)
         row_h = self._row_heights.get(r, CARD_H)
         cards = []
+        import plant_db as _pdb
+        thumb_map = _pdb.get_thumbs([plant.id for _c, plant in items])
         for c, plant in items:
             pid = plant.id
+            role = self._row_roles.get(pid, "")
+            prefetched = thumb_map.get(pid)
             card = self._card_cache.get(pid)
+            if card is not None and card.plant is not plant:
+                # Same widget, possibly same ID: re-bind so label edits and a
+                # regenerated thumbnail are reflected without rebuilding.
+                card.set_plant(plant, role, prefetched)
             if card is None:
-                card = MiniPlantCard(plant, self._pal,
-                                     role=self._row_roles.get(pid, ""),
-                                     card_font=self._card_font,
-                                     card_font_size=max(6, self._card_font_size - 1),
-                                     parent=self._grid_widget)
-                card.edit_requested.connect(self._edit_plant)
-                card.delete_requested.connect(self._delete_plant)
-                card.add_to_lineage_requested.connect(self.add_to_lineage.emit)
-                card.selected_signal.connect(self._on_card_selected)
-                card.installEventFilter(self)
+                if self._spare_cards:
+                    card = self._spare_cards.pop()
+                    card.set_plant(plant, role, prefetched)
+                    card.setParent(self._grid_widget)
+                else:
+                    card = MiniPlantCard(
+                        plant, self._pal, role=role,
+                        card_font=self._card_font,
+                        card_font_size=max(6, self._card_font_size - 1),
+                        parent=self._grid_widget)
+                    card._prefetched_thumb = prefetched
+                    card.edit_requested.connect(self._edit_plant)
+                    card.delete_requested.connect(self._delete_plant)
+                    card.add_to_lineage_requested.connect(
+                        self.add_to_lineage.emit)
+                    card.selected_signal.connect(self._on_card_selected)
+                    card.installEventFilter(self)
                 self._card_cache[pid] = card
             elif card.parent() is not self._grid_widget:
                 card.setParent(self._grid_widget)
-            if card.plant is not plant:
-                card.plant = plant
-                card.setToolTip(
-                    f"{plant.name}\n{plant.species or ''}\n{plant.year or ''}")
+                if card._role != role:
+                    card._role = role
+                    card._apply_plant_data()
+            elif card._role != role:
+                card._role = role
+                card._apply_plant_data()
+            if not card._image_loaded and card._prefetched_thumb is None:
+                card._prefetched_thumb = prefetched
             # Keep earlier measured row height so scrolling never causes a
             # jarring vertical jump when a tall card leaves the viewport.
             card.setMinimumHeight(row_h)
@@ -1881,21 +1965,36 @@ class PlantGridView(QWidget):
             self._img_decode_timer.start()
         return height_changed
 
+    def _recycle_card(self, card) -> None:
+        """Remove a card from the layout and keep it for the next row."""
+        try:
+            self._grid_layout.removeWidget(card)
+        except Exception:
+            pass
+        try:
+            self._img_decode_queue.remove(card)
+        except ValueError:
+            pass
+        pid = getattr(card.plant, "id", None)
+        if pid and self._card_cache.get(pid) is card:
+            self._card_cache.pop(pid, None)
+        card.hide()
+        if len(self._spare_cards) < _SPARE_CARD_LIMIT:
+            self._spare_cards.append(card)
+        else:
+            card.deleteLater()
+
+    def _dispose_spare_cards(self) -> None:
+        for card in self._spare_cards:
+            card.deleteLater()
+        self._spare_cards.clear()
+
     def _dematerialise_row(self, r: int) -> None:
         cards = self._row_cards.pop(r, None)
         if cards is None:
             return
         for card in cards:
-            self._grid_layout.removeWidget(card)
-            try:
-                self._img_decode_queue.remove(card)
-            except ValueError:
-                pass
-            pid = getattr(card.plant, "id", None)
-            if pid and self._card_cache.get(pid) is card:
-                self._card_cache.pop(pid, None)
-            card.hide()
-            card.deleteLater()
+            self._recycle_card(card)
         self._add_row_placeholder(r)
 
     def _materialize_all_rows(self) -> None:

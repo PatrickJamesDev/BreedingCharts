@@ -220,6 +220,8 @@ bench("canvas repaint (20 frames)", lambda: _repaint(win._view, 20), repeat=1)
 
 # ── 2. Grid / Spreadsheet view ───────────────────────────────────────────────
 print("\n[ grid view ]")
+win._open_grid_view()
+settle(150)
 grid._all_plants = plant_db.get_all()
 grid._role_map_cache = None
 bench("grid _rebuild_grid (cold)", grid._rebuild_grid, repeat=3)
@@ -230,6 +232,39 @@ bench("grid search keystroke", grid._rebuild_grid, repeat=3)
 grid._search.clear()
 settle(250)
 bench("grid resize (same width)", lambda: grid.resize(1600, 1000), repeat=3)
+
+def _settle_grid_rows(view) -> None:
+    for _ in range(100):
+        view._build_next_card_batch()
+        if all(r in view._row_cards for r in view._active_rows):
+            break
+
+def _scroll_run(step: int, steps: int, settle_rows: bool = False) -> None:
+    sb = grid._scroll.verticalScrollBar()
+    sb.setValue(0)
+    grid._update_visible_rows(force=True)
+    _settle_grid_rows(grid)
+    for _ in range(steps):
+        sb.setValue(min(sb.maximum(), sb.value() + step))
+        grid._update_visible_rows()
+        grid._build_next_card_batch()
+    if settle_rows:
+        _settle_grid_rows(grid)
+
+def _jump_run(fraction: float) -> None:
+    sb = grid._scroll.verticalScrollBar()
+    sb.setValue(0)
+    grid._update_visible_rows(force=True)
+    _settle_grid_rows(grid)
+    sb.setValue(int(sb.maximum() * fraction))
+    grid._update_visible_rows()
+    _settle_grid_rows(grid)
+
+bench("grid scroll 60px steps x40", lambda: _scroll_run(60, 40), repeat=3)
+bench("grid scroll 50% jump + settle", lambda: _jump_run(0.5), repeat=3)
+grid._scroll.verticalScrollBar().setValue(0)
+grid._update_visible_rows(force=True)
+_settle_grid_rows(grid)
 bench("grid sheet mode rebuild", grid._rebuild_plant_sheet, repeat=2)
 
 # ── 3. Notes view ────────────────────────────────────────────────────────────
@@ -358,6 +393,10 @@ grid_cards = list(grid._card_cache.values())
 check("grid cards all parented", all(c.parent() is not None for c in grid_cards))
 check("grid live cards bounded by visible plants",
       0 < len(grid_cards) <= len(grid._visible_plants))
+check("grid spare card pool bounded",
+      len(getattr(grid, "_spare_cards", [])) <= 120)
+row_pids = {c.plant.id for cards in grid._row_cards.values() for c in cards}
+check("grid cache matches materialised rows", set(grid._card_cache) == row_pids)
 
 print(f"  ---> {'all checks passed' if not _failures else str(len(_failures)) + ' FAILED'}")
 

@@ -219,11 +219,16 @@ def save_lineage(tree: LineageTree, filepath: str) -> bool:
 
         from fileio import atomic_write_json, path_lock
         with path_lock(filepath):
+            # Images first: if the sidecar merge fails, the document must not
+            # be written, otherwise it could reference photos that never made
+            # it to disk.  Eviction waits until both writes succeed.
+            need_merge = bool(tree._image_loaded_ids or tree._images_maybe_stale)
+            if need_merge:
+                if not lineage_images.merge_and_save(tree, filepath):
+                    raise RuntimeError("lineage image sidecar merge failed")
             atomic_write_json(filepath, d)
 
-        if tree._image_loaded_ids or tree._images_maybe_stale:
-            if not lineage_images.merge_and_save(tree, filepath):
-                raise RuntimeError("lineage image sidecar merge failed")
+        if need_merge:
             lineage_images.evict_saved_images(tree)
             tree._images_maybe_stale = False
 
@@ -277,12 +282,12 @@ def write_prepared_save(prepared: dict, filepath: str) -> bool:
     try:
         from fileio import atomic_write_json, path_lock
         with path_lock(filepath):
+            if prepared["need_image_merge"]:
+                if not lineage_images.merge_and_save_snapshot(
+                        filepath, prepared["images_snapshot"],
+                        prepared["valid_ids"]):
+                    raise RuntimeError("lineage image sidecar merge failed")
             atomic_write_json(filepath, prepared["doc"])
-        if prepared["need_image_merge"]:
-            if not lineage_images.merge_and_save_snapshot(
-                    filepath, prepared["images_snapshot"],
-                    prepared["valid_ids"]):
-                raise RuntimeError("lineage image sidecar merge failed")
         d = prepared["doc"]
         meta = write_lineage_meta(filepath, d)
         try:

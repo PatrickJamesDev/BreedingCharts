@@ -620,6 +620,40 @@ def populate_images(node: PlantNode) -> None:
     node.images = list(get_images(node.id))
 
 
+def get_thumbs(plant_ids) -> Dict[str, Optional[str]]:
+    """Return thumbnails for several plants in one query.
+
+    Grid rows materialise a handful of cards at a time; issuing one SQLite
+    query per card adds avoidable overhead.  Pending (not-yet-flushed) values
+    win over the stored copy, exactly like get_thumb().
+    """
+    ids = list(dict.fromkeys(str(pid) for pid in plant_ids if pid))
+    if not ids:
+        return {}
+    _load_raw()
+    out: Dict[str, Optional[str]] = {pid: None for pid in ids}
+    with _lock:
+        for pid in ids:
+            if pid in _thumb_pending:
+                out[pid] = _thumb_pending[pid]
+        missing = [pid for pid in ids if pid not in _thumb_pending]
+        if not missing:
+            return out
+        try:
+            conn = _ensure_conn()
+            for start in range(0, len(missing), 500):
+                chunk = missing[start:start + 500]
+                marks = ",".join("?" * len(chunk))
+                for pid, data in conn.execute(
+                        f"SELECT plant_id,data FROM thumbs"
+                        f" WHERE plant_id IN ({marks})", chunk):
+                    out[pid] = _thumb_text(data)
+        except Exception as e:
+            log.error("plant_db: get_thumbs failed for %d id(s): %s",
+                      len(missing), e)
+    return out
+
+
 def get_thumb(plant_id: str) -> Optional[str]:
     """Return a plant's base64 thumbnail without loading full-resolution images.
 
@@ -628,18 +662,7 @@ def get_thumb(plant_id: str) -> Optional[str]:
     when they actually become visible; the result is immediately decoded into
     QPixmapCache and never retained by the model.
     """
-    _load_raw()
-    with _lock:
-        if plant_id in _thumb_pending:
-            return _thumb_pending[plant_id]
-        try:
-            conn = _ensure_conn()
-            row = conn.execute(
-                "SELECT data FROM thumbs WHERE plant_id=?", (plant_id,)).fetchone()
-            return _thumb_text(row[0]) if row else None
-        except Exception as e:
-            log.error("plant_db: get_thumb failed for %s: %s", plant_id, e)
-            return None
+    return get_thumbs([plant_id]).get(plant_id)
 
 
 def set_thumb(plant_id: str, thumb: Optional[str]) -> None:

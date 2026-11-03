@@ -836,7 +836,9 @@ Follow-ups that these changes require:
 - Raise `QPixmapCache.setCacheLimit` at `main.py:82–86` by ≈16 MB (N6).
 - Import `PlantNodeItem` at module top in `canvas_view.py` (my test used a local import).
 
-### 13.9 F23–F24 — move thumbnails out of metadata (`plant_db.py`, `image_utils.py`) — proposed
+### 13.9 F24 — move thumbnails out of metadata (`plant_db.py`, `image_utils.py`) — implemented
+
+F24 landed with a single thumbnail BLOB per plant plus a batched `get_thumbs()` lookup; the two-size (`small`/`large`) split in F23 remains proposed.
 
 ```sql
 CREATE TABLE IF NOT EXISTS thumbs(
@@ -853,7 +855,9 @@ CREATE TABLE IF NOT EXISTS thumbs(
 5. One-time migration inside `_ensure_conn` (`:150`): for each row whose `meta_json` has `thumb`, insert into `thumbs` (decoding base64 once, creating `small` with `QImageReader` scaled decode) and rewrite `meta_json` without it, in a single transaction, then `VACUUM`.
 6. `PlantNode.thumb` (`models.py`) stays as a *transient* attribute for lineages; `.plf` files keep their current inline thumbnail until F30/F31 land, so nothing in the file format changes in this step.
 
-### 13.10 F31 — per-node image store instead of the JSON sidecar (`lineage_images.py`) — proposed
+### 13.10 F31 — per-node image store instead of the JSON sidecar (`lineage_images.py`) — implemented
+
+Implemented as one `<name>.plf.images.sqlite3` per lineage (rather than one shared database keyed by lineage), with sidecar-first saves and reusable read connections.
 
 Keep the public functions (`load_all_images`, `get_node_images`, `save_all_images`, `populate_node_images`, `snapshot_for_merge`, `merge_and_save_snapshot`, `merge_and_save`, `evict_saved_images`, `delete_sidecar`) so the ≈ 20 call sites in `ui_main.py`, `database.py`, `data_bundle.py` do not change.
 
@@ -897,7 +901,9 @@ self._grid_widget.setStyleSheet(f"""
 
 Measured on 800 cards × 6 labels: 823 → 307 ms (M1). The exact palette keys must match what `MiniPlantCard` reads today (`self._pal.get(...)` at the lines above). This also removes the need for `QPixmapCache.clear()` at `:952` (F37).
 
-### 13.12 F33 — virtualised card grid (outline) — proposed
+### 13.12 F33 — virtualised card grid (outline) — implemented
+
+Implemented with virtualised widget rows, progressive one-row-per-tick materialisation and a bounded spare-card pool rather than the delegate sketch below; the scalability goal is the same.
 
 Why: widget-per-plant measured 717 ms for 500 plants and 4,185 ms for 2,000 (≈ 8 widgets each); a delegate-painted `QListView` was ready in 22 ms at 5,000 and does not grow with N (§9.1 rows 9–11).
 
@@ -1187,7 +1193,7 @@ Proposed (not run): in `remove_node` (`:787`), `remove_connection` (`:814`) pop 
 | Notes after data-folder switch | old notes | correct (F9) |
 | `get_generation` with dangling parent | `ValueError` | `0` (F8) |
 
-Not yet run in the patched copy: F3/F58 (atomic writes), F4, F5, F7, F23–F33, F37–F54 apart from those listed. The structural items (thumbnail storage, per-node image store, virtualised grid) have the largest remaining upside but also the largest regression risk, so they should land behind the regression tests in §13.14.
+Not yet run at the time of this pass: F3/F58 (atomic writes), F4, F5, F7, F23–F33, F37–F54 apart from those listed. Since then F24, F31 and F33 have landed behind the regression scripts in `tools/verification/`; F23, F30, F32 and the remaining items are still outstanding.
 
 ---
 
@@ -1316,7 +1322,7 @@ The same change belongs in the synchronous `save_lineage` (`database.py:149–18
 | Failed background save | photos lost | photos restored, re-saved |
 | Year labels / notes folder switch / dangling-parent layout | wrong / wrong / exception | correct |
 
-Outstanding, not yet applied or measured end-to-end: atomic writes (F3/F58), thumbnail and image-store restructuring (F23, F24, F30, F31), virtualised grid (F33), card-stylesheet consolidation (F32), `upsert_many` (§10.3), undo diffing (F64). These are the changes that will move large-database behaviour the most and should be done next, behind the regression tests in §13.14.
+Outstanding at the time of this pass: atomic writes (F3/F58), thumbnail and image-store restructuring (F23, F24, F30, F31), virtualised grid (F33), card-stylesheet consolidation (F32), `upsert_many` (§10.3), undo diffing (F64). Since then F24, F31 and F33 have landed; F23, F30, F32, `upsert_many` and F64 remain the largest next wins.
 
 ---
 
@@ -1436,7 +1442,7 @@ Follow-ups: `apply_card_settings` (`:941`) must reset `card._style_state = None`
 
 ### 16.6 What the patched copy now contains
 
-Verified and applied: F1, F2, F3/F58 (for `.plf`, sidecar and settings), F5, F6, F8, F9, F17, F18, F19, F20, F25, F37, F38, F55, F56, F57 (`add_node`), F61, F62, F65. Remaining items are proposals; the largest are the thumbnail/metadata split (F23/F24), the per-node image store (F31), the virtualised grid (F33), `.plf.meta` headers (F30), `upsert_many`, undo diffing (F64) and the remaining non-`.plf` write sites (`data_bundle.py:179`, `notes_store.py:83`, `database.py:293, 340`).
+Verified and applied: F1, F2, F3/F58 (for `.plf`, sidecar and settings), F5, F6, F8, F9, F17, F18, F19, F20, F24, F25, F31, F33, F37, F38, F55, F56, F57 (`add_node`), F61, F62, F65. Remaining items are proposals; the largest are the two-size thumbnail split (F23), `.plf.meta` headers (F30), card stylesheet consolidation (F32), `upsert_many`, undo diffing (F64) and the remaining non-`.plf` write sites (`data_bundle.py:179`, `notes_store.py:83`, `database.py:293, 340`).
 
 To reproduce any number in this document you need only Python 3.12+, `PyQt6`, `orjson` and `QT_QPA_PLATFORM=offscreen`; each experiment redirected the data directory to a temp folder so no real data was touched.
 
@@ -1452,9 +1458,9 @@ Legend: **Applied + tested** = in `BreedingCharts_v1_24_perf_patched.zip` and ex
 
 | Status | Fix IDs |
 | --- | --- |
-| **Applied + tested** | F1 (grid constants), F2 (failed-save photo restore), F3/F58/F68 (atomic writes for `.plf`, sidecar, settings), F5 (select-all respects filter), F6 (year-row revision), F7 (open does not write), F8 (`get_generation`), F9 (notes cache), F10 (sheet parents), F15 (decode token), F17–F19 (card cache, background cache, dot guard), F20 (port hit-test), F22 (scaled JPEG decode), F25 (search haystacks), F26 (revision wiring), F27 (`remove_many`), F29 (coalesced settings), F37, F38, F45, F51 (JPEG for photos), F55, F56, F57 (`add_node`), F61, F62, F65 (painted card chrome) |
+| **Applied + tested** | F1 (grid constants), F2 (failed-save photo restore), F3/F58/F68 (atomic writes for `.plf`, sidecar, settings), F5 (select-all respects filter), F6 (year-row revision), F7 (open does not write), F8 (`get_generation`), F9 (notes cache), F10 (sheet parents), F15 (decode token), F17–F19 (card cache, background cache, dot guard), F20 (port hit-test), F22 (scaled JPEG decode), F24 (thumbnail BLOB table, batch `get_thumbs`), F25 (search haystacks), F26 (revision wiring), F27 (`remove_many`), F29 (coalesced settings), F31 (per-node SQLite image store, sidecar-first saves, read-connection reuse), F33 (virtualised rows, progressive build, bounded card recycling), F37, F38, F45, F51 (JPEG for photos), F55, F56, F57 (`add_node`), F61, F62, F65 (painted card chrome) |
 | **Applied** | F4 (wait for running save), F13, F14, F16, F41, F48, F66, F59/F69 (`orjson` listed in `requirements.txt`) |
-| **Proposal** | F11 (barycenter), F12 (role-map key), F21 (`IMG_SCALE`), F23/F24 (small thumbnails, thumbnail table), F28 (evict after lineage upsert), F30 (`.plf.meta` header), F31 (per-node image store), F32 (card stylesheets → container sheet), F33 (virtualised grid), F34/F35/F36 (paint micro-caches), F39/F40 (grid decode pool, event filters), F42 (incremental edge updates beyond `add_node`), F43/F64 (undo diffing), F44 (edge paint caches), F46 (comment `tree_changed`), F47 (`_ensure_conn` lock), F49 (settings diffing), F50 (autocomplete cache), F52 (notes storage), F53 (`build_exe.py`), F54 (post-show warm-up), F60, F63, F67 |
+| **Proposal** | F11 (barycenter), F12 (role-map key), F21 (`IMG_SCALE`), F23 (two-size thumbnail pair), F28 (evict after lineage upsert), F30 (`.plf.meta` header), F32 (card stylesheets → container sheet), F34/F35/F36 (paint micro-caches), F39/F40 (grid decode pool, event filters), F42 (incremental edge updates beyond `add_node`), F43/F64 (undo diffing), F44 (edge paint caches), F46 (comment `tree_changed`), F47 (`_ensure_conn` lock), F49 (settings diffing), F50 (autocomplete cache), F52 (notes storage), F53 (`build_exe.py`), F54 (post-show warm-up), F60, F63, F67 |
 
 Why the proposals were left out of the zip: each one changes a data format, a storage layout, a widget architecture, or the visual quality of the canvas, so each needs an owner decision and a migration or regression test rather than a drop-in patch. F21 in particular trades image sharpness at high zoom for 4× less RAM; it should be a setting, not a silent change.
 
@@ -1503,18 +1509,19 @@ All numbers from the same sandbox; variance between runs on this shared machine 
 | Save of a 46 MB lineage | 535–570 ms (no fsync) | \~100–450 ms (with fsync, atomic) |
 | UI-thread parse after each background save (46 MB) | 113–132 ms | 0 |
 
+Post-audit implementation measurements (current repo, 600 plants / 80 notes / 120 lineage nodes unless noted, offscreen 1400×900): grid scroll 60 px × 40 steps 38.5 ms median (first 161.8 ms); 50% scroll jump + settle 30.6 ms (first 82.4 ms); 1,500 plants stay at 18 live cards with a 41,114 px scroll extent; a 120-plant export rendered 1,892×3,646 px, restored 45 live cards and decoded 3 off-screen photos; `save_lineage` 17.8 ms and `load_lineage` 3.1 ms. These replace the earlier grid and persistence estimates where they conflict.
+
 ### 17.4 What to do next, in order
 
 1. **Try the patched zip on a copy of your data** (back up the data folder first). Open your lineages, switch to Grid and Spreadsheet, select/delete a few plants, paste a photo, zoom and pan a large lineage, and quit and relaunch. The things most worth eyeballing: card selection/hover look in the grid (F65), no layout change on open (F7), and photos surviving a save/reopen (F2, F51).
 2. **Add `orjson`** (`pip install orjson`) to the environment you build from, then add it to the PyInstaller build (F53/F59). Without it saves still work but use the slower streamed encoder.
 3. **Decide on three behaviours**: (a) whether "auto-layout on open" should keep re-laying-out every open (current) or only for lineages without stored positions; (b) whether the canvas image resolution (`IMG_SCALE`, F21) should become a setting; (c) whether `.plf` files may stay compact (not hand-editable).
-4. **Then do the structural work, in this order**, each behind the regression checklist in §13.14 and the scripts in `tools/verification/`:
+4. **Continue the structural work, in this order**, each behind the regression checklist in §13.14 and the scripts in `tools/verification/`. F24, F31 and F33 are now done:
    1. F30 `.plf.meta` header (small, safe, large win for big libraries);
-   2. F24/F23 thumbnails out of the metadata row and a 360/640 px pair (biggest RAM and startup win for photo databases);
-   3. F31 per-node image store (removes whole-file sidecar parsing/rewriting);
-   4. F33 virtualised grid + F32 (the scalability ceiling of the Grid View);
-   5. F42/F44/F64 incremental edges, edge paint caches, undo diffing;
-   6. F11/F12 correctness fixes in auto-organise and the role map.
+   2. F23 two-size thumbnail pair (further RAM/startup relief for photo databases);
+   3. F32 card stylesheet consolidation;
+   4. F42/F44/F64 incremental edges, edge paint caches, undo diffing;
+   5. F11/F12 correctness fixes in auto-organise and the role map.
 5. **Keep the benchmarks**: `tools/verification/` plus a photo-seeded stress dataset (§8.5) turns every regression in this document into a failing test.
 
 ### 17.5 Limits of this audit

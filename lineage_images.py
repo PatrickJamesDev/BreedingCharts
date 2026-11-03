@@ -35,6 +35,7 @@ import logging
 import os
 import sqlite3
 import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,9 @@ CREATE INDEX IF NOT EXISTS idx_node_images_node ON node_images(node_id);
 """
 
 _migrate_lock = threading.Lock()
+_READ_CONN_LIMIT = 8
+_read_lock = threading.RLock()
+_read_conns: "OrderedDict[str, sqlite3.Connection]" = OrderedDict()
 
 
 def images_filepath(plf_path: str) -> str:
@@ -62,14 +66,56 @@ def legacy_images_filepath(plf_path: str) -> str:
     return plf_path + _LEGACY_SUFFIX
 
 
-def _connect(path: str) -> sqlite3.Connection:
+def _connect(path: str, check_same_thread: bool = True) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=10,
+                           check_same_thread=check_same_thread)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.executescript(_SCHEMA)
     return conn
+
+
+def _get_read_conn(path: str) -> sqlite3.Connection:
+    """Reuse a small pool of read connections instead of reopening SQLite for
+    every node's lazy image load.  Guarded because the pool is shared by UI
+    and worker threads; SQLite itself still serialises concurrent writers."""
+    conn = _read_conns.pop(path, None)
+    if conn is None:
+        conn = _connect(path, check_same_thread=False)
+    _read_conns[path] = conn
+    while len(_read_conns) > _READ_CONN_LIMIT:
+        _old_path, old_conn = _read_conns.popitem(last=False)
+        try:
+            old_conn.close()
+        except Exception:
+            pass
+    return conn
+
+
+def _drop_read_conn(path: str) -> None:
+    conn = _read_conns.pop(path, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def close_read_connections(plf_path: Optional[str] = None) -> None:
+    """Close cached read handles, optionally for one lineage file only.
+    Called before deleting a sidecar so the file can be removed cleanly."""
+    with _read_lock:
+        if plf_path is None:
+            while _read_conns:
+                _old_path, conn = _read_conns.popitem(last=False)
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return
+        _drop_read_conn(images_filepath(plf_path))
 
 
 def _load_legacy(plf_path: Optional[str]) -> Dict[str, List[str]]:
@@ -151,13 +197,16 @@ def load_all_images(plf_path: Optional[str]) -> Dict[str, List[str]]:
         return _load_legacy(plf_path)
     out: Dict[str, List[str]] = {}
     try:
-        conn = _connect(db_path)
-        try:
-            for nid, data in conn.execute(
-                    "SELECT node_id,data FROM node_images ORDER BY node_id,idx"):
-                out.setdefault(nid, []).append(data)
-        finally:
-            conn.close()
+        with _read_lock:
+            conn = _get_read_conn(db_path)
+            try:
+                for nid, data in conn.execute(
+                        "SELECT node_id,data FROM node_images"
+                        " ORDER BY node_id,idx"):
+                    out.setdefault(nid, []).append(data)
+            except Exception:
+                _drop_read_conn(db_path)
+                raise
     except Exception as e:
         log.error("lineage_images: failed to read %s: %s", db_path, e)
         return _load_legacy(plf_path)
@@ -174,13 +223,15 @@ def get_node_images(plf_path: Optional[str], node_id: str) -> List[str]:
     if not os.path.isfile(db_path):
         return list(_load_legacy(plf_path).get(node_id, []))
     try:
-        conn = _connect(db_path)
-        try:
-            return [row[0] for row in conn.execute(
-                "SELECT data FROM node_images WHERE node_id=? ORDER BY idx",
-                (node_id,))]
-        finally:
-            conn.close()
+        with _read_lock:
+            conn = _get_read_conn(db_path)
+            try:
+                return [row[0] for row in conn.execute(
+                    "SELECT data FROM node_images"
+                    " WHERE node_id=? ORDER BY idx", (node_id,))]
+            except Exception:
+                _drop_read_conn(db_path)
+                raise
     except Exception as e:
         log.error("lineage_images: get_node_images failed for %s: %s",
                   node_id, e)
@@ -212,6 +263,7 @@ def save_all_images(plf_path: str, images_by_node: Dict[str, List[str]]) -> bool
 
 
 def delete_sidecar(plf_path: str) -> None:
+    close_read_connections(plf_path)
     for p in (images_filepath(plf_path),
               legacy_images_filepath(plf_path),
               legacy_images_filepath(plf_path) + ".migrated"):
